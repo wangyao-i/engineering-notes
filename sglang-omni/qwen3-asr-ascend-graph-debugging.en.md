@@ -12,9 +12,9 @@
 
 While enabling full-graph execution for Qwen3-ASR on Ascend NPU, we encountered two failures: CANN error 107033 and a silent, no-progress stall.
 
-The investigation separated two mechanisms. Encoder and decoder graph-update transactions could contend on the same update stream and violate the CANN task-group state contract. Independently, a cache-hit H2D transfer issued from a request-building thread could enter a shared Host submission queue and, under specific memory and timing conditions, form a dependency cycle with decoder compute and the encoder update signal.
+The investigation separated two mechanisms. Encoder and decoder graph-update transactions could contend on the same update stream and violate the CANN task-group state contract. With the default shared Host submission queue, a cache-hit H2D transfer could also create a cross-stream Host-side dependency with graph updates.
 
-The final fix does not rely on additional global locking or thread-scheduling luck. It makes ownership explicit: the encoder graph runner owns FIA graph updates, the encoder worker owns NPU cached-embedding transfers, and admission completes only when an embedding is actually ready for LM consumption.
+The final design does not add global locking or move cache transfers into the encoder worker. Each encoder graph runner owns its FIA update stream, and the NPU worker starts with `PER_STREAM_QUEUE=1` so distinct device streams use distinct Host queues. Cache hits retain the existing caller-thread attach path used by the GPU implementation.
 
 ## 1. Background
 
@@ -72,7 +72,7 @@ CANN's internal mutex protects an individual API call. It does not automatically
 
 The second failure produced no Python exception and no clear CANN error. Requests stopped completing, threads remained around graph-update submission, and an external watchdog eventually had to terminate the process.
 
-Later evidence showed that this was not simply another manifestation of 107033. It involved a dependency cycle across the Host submission queue, an implicit H2D synchronization, and graph completion events.
+Later evidence showed that this was not simply another manifestation of 107033. Version-matched source, thread stacks, and a reduced probe preserving the execution mechanism support a bounded mechanism in which a shared Host queue, implicit H2D synchronization, and graph events form a dependency cycle. This does not establish that every historical stall had the same cause.
 
 ## 3. Hypotheses, Discriminating Tests, and Rejections
 
@@ -107,13 +107,11 @@ Cached audio embeddings live on CPU. The old path called `.to(device, non_blocki
 
 That flag describes the requested API behavior, not every lower-level condition. For pageable or unregistered Host memory, the runtime can still synchronize the target stream inside the copy path. The Python call may look asynchronous while the Host Repository consumer is blocked in a stream synchronization.
 
-### 4.3 The future completed under the wrong contract
+### 4.3 Per-stream Host queues preserve the existing cache path
 
-The old implementation attached the cached embedding and immediately returned a completed future. In practice, the future meant "the cache entry was found and a copy was initiated." Its consumer interpreted it as "the embedding is ready for safe LM consumption."
+An early repair moved cache-hit H2D into the encoder worker and delayed its future until stream synchronization. Later experiments showed that enabling `PER_STREAM_QUEUE=1` before NPU runtime initialization prevents distinct device streams from sharing the default Host queue, allowing the existing caller-thread attach path to remain stable. The final PR therefore removes the additional transfer type, worker-queue branch, and deferred-admission semantics.
 
-Device completion and request admission had become semantically misaligned.
-
-## 5. The Silent-Stall Dependency Cycle
+## 5. The Bounded Silent-Stall Dependency Mechanism
 
 A repaired diagnostic collector obtained complete thread stacks. Combined with version-matched torch_npu/CANN source and a reduced probe that preserved the same execution mechanism, the dependency chain was:
 
@@ -144,90 +142,68 @@ The thread evidence placed the Repository consumer in the implicit H2D synchroni
 
 There is still an evidence boundary: the exact final device task associated with the stalled event was not read directly from the device. The last signal relationship is partly code-derived from the reduced single-event program and API contracts. The evidence closes the causal loop for the reproduced silent-stall mechanism, but it does not prove that every historical failure had the same cause.
 
-## 6. Final Design: Make Device-Work Ownership Explicit
+## 6. Final Design: Graph-Update Ownership and Host-Queue Isolation
 
 ### 6.1 Encoder-owned graph replay and FIA updates
 
-Each encoder graph runner owns an update stream on the same device. During capture, the graph places an external event wait around every updatable FIA task. At replay time, the encoder worker performs one owned handshake:
+Each encoder graph runner owns an update stream on the same device. During capture, the graph places an external event wait around every updatable FIA task. At replay time, the encoder worker starts a short-lived Host thread for the update submission while replaying the graph on the caller thread:
 
 ```mermaid
 sequenceDiagram
     participant EW as Encoder worker
     participant ES as Encoder compute stream
+    participant UT as Update Host thread
     participant G as Captured encoder graph
     participant US as Runner-owned update stream
 
     EW->>ES: Copy current hidden states into static input
-    EW->>US: wait_stream(encoder compute stream)
-    EW->>ES: Enqueue graph replay
+    EW->>UT: Start current update submission
+    UT->>US: wait_stream(encoder compute stream)
+    EW->>G: Replay graph
     ES->>G: Replay reaches captured event.wait
     G-->>ES: Wait for current FIA parameters
-    EW->>US: graph_task_update_begin(handle)
-    EW->>US: Submit current cumulative window lengths
-    EW->>US: graph_task_update_end()
-    EW->>US: event.record()
+    UT->>US: graph_task_update_begin(handle)
+    UT->>US: Submit current cumulative window lengths
+    UT->>US: graph_task_update_end() + event.record()
     US-->>G: Release event wait
+    EW->>UT: join
     G-->>ES: Continue with current boundaries
 ```
 
 The initial `wait_stream` is a dependency edge, not a device-wide synchronization. It prevents the update sequence from overtaking encoder input preparation while preserving asynchronous graph execution.
 
-Replay is intentionally submitted before the updates. The captured graph already waits before each FIA task; replay establishes the consumer side of the handshake, and the subsequent event record releases it with the current parameters.
+The update thread and replay must make progress concurrently; captured event waits connect the consumer with the current FIA parameter update. The graph handle, update stream, task events, and static buffers belong to one runner. If capture fails for a bucket, only that bucket remains on the eager path; the current implementation does not add a separate terminal-failure state.
 
-The graph handle, update stream, task events, and failure state now share one owner and lifetime. If replay, update Begin/End, the FIA operation, or event recording fails after the handshake starts, a retry may leave a graph waiting for a signal that will never arrive. Such failures are terminal for the encoder worker. Allocation, eager warmup, pool acquisition, and backend-setup failures before graph-context entry leave only the affected bucket on the eager path.
+### 6.2 One graph per token bucket
 
-### 6.2 Encoder-worker-owned cached embedding transfer
+Inputs in the same token bucket can carry different `effective_window_lens`. The final implementation stores one graph per bucket size and supplies the current cumulative window boundaries to every captured FIA task before each replay. Capture-local `attention_metadata` is passed explicitly through the layer stack so one capture's Host boundaries do not become mutable runner-wide state.
 
-An NPU cache hit no longer submits H2D from the request builder. It becomes a `CachedEmbeddingTransfer` and enters the existing single encoder-worker queue:
+### 6.3 Per-stream Host queues and the cache path
 
-```mermaid
-flowchart LR
-    A[Request builder finds CPU cache hit] --> B[submit_cached_embedding]
-    B --> C[Enqueue CachedEmbeddingTransfer]
-    C --> D[Encoder worker / execute_batch]
-    D --> E[Enter encoder private stream]
-    E --> F[Submit CPU-to-NPU copy]
-    F --> G[record_stream for LM consumer lifetime]
-    G --> H[Synchronize encoder stream]
-    H --> I[Resolve transfer future]
-    I --> J[DeferredAdmission releases request]
+The NPU pipeline defaults `PER_STREAM_QUEUE=1` before spawning workers. Explicit shell or pipeline settings take precedence. Graph startup also requires `TASK_QUEUE_ENABLE` to be unset, `1`, or `2`, and rejects `ASCEND_LAUNCH_BLOCKING=1`. These values must be established before torch_npu initialization because the runtime caches its Host-queue configuration.
 
-    B -. non-NPU .-> K[Caller-thread attach]
-    K --> L[Already-completed future]
-    L --> M[Immediate admission]
-```
+Cache hits retain the existing caller-thread attach and already-completed future path. The final PR does not modify `encoder_service.py`, add a transfer type or second encoder queue, or introduce an additional stream synchronization.
 
-The completion contract changes from:
-
-```text
-old: future ready = cache hit found and copy attempted
-new: future ready = embedding is safe for LM consumption
-```
-
-The worker retains the CPU source until synchronization so cache eviction cannot invalidate an in-flight copy. It registers the LM consumer stream with `record_stream()` for allocator safety and synchronizes the transfer stream before resolving the future. `record_stream()` protects storage lifetime; it does not by itself prove that H2D has completed, so it cannot replace synchronization at the admission boundary.
-
-A transfer failure rejects admission. Single-flight followers reuse the leader's completed device work and publish only ready embedding metadata; they do not issue duplicate device work from callback threads.
-
-### 6.3 Ownership and completion contract
+### 6.4 Ownership contract
 
 | Component | Owns | Completion signal |
 | --- | --- | --- |
-| Request-building thread | Request construction and deferred admission | Does not submit NPU cached-transfer work |
-| Encoder worker | Encoder batches and NPU cache-hit transfers | Resolves the future only after stream synchronization |
-| Encoder compute stream | Static-input copy, encoder graph replay, and transfer work | Ordered by stream dependencies |
+| Request-building thread | Request construction and the existing cache-hit attach | Keeps the existing completed-future contract |
+| Encoder worker | Encoder batches and graph replay | Returns the encoder output after replay completes |
+| Encoder compute stream | Static-input copy and encoder graph replay | Ordered by stream dependencies |
 | Per-runner update stream | FIA task-group updates and completion events | Event records release graph replay |
-| LM/default stream | Consumption of the ready embedding | Registered with `record_stream()` for allocator lifetime |
+| Per-stream Host queue | Isolation of Host submissions for distinct device streams | Configured before worker startup |
 
-CUDA, ROCm, XPU, and CPU keep the previous caller-thread attach and already-completed future. They do not enter the NPU transfer queue, and their existing graph and eager-fallback behavior remains unchanged.
+CUDA, ROCm, XPU, and CPU do not enable NPU graph-task updates; their existing graph replay, cache-hit, and eager-fallback behavior remains unchanged.
 
 ## 7. Why No SGLang Patch Is Required
 
-The final change corrects ownership and admission inside SGLang-Omni:
+The final change is contained in SGLang-Omni's encoder graph capture/replay and NPU worker startup configuration:
 
 - the encoder runner owns the full NPU graph-update lifecycle;
-- the encoder worker owns cache-hit H2D;
-- the request builder no longer injects NPU copies into a shared submission path;
-- requests enter the LM only after the embedding is actually ready.
+- FIA Host parameters are updated with the current window boundaries before each replay;
+- per-stream Host queues isolate submissions from distinct device streams;
+- cache-hit H2D retains the existing SGLang-Omni path.
 
 The design therefore works with unmodified SGLang v0.5.19 at `0bcd8223` and does not depend on SGLang PR #40059.
 
@@ -249,9 +225,9 @@ After conflict resolution, merge head `b8ea8032` completed native CPU regression
 
 ### Current head must not inherit older hardware evidence
 
-At publication preparation time, the PR's squashed head is `f560a3c7`. It adds review cleanup that narrows terminal capture-failure classification, scopes worker-owned cached transfers to NPU, and clarifies the metadata-only helper name.
+At this article update, the PR head is `8fe0e163` on base `d290c100`. The current code has removed the worker-owned cached-transfer and terminal graph-failure mechanisms in favor of per-stream Host queues plus the existing cache-attach path.
 
-The current head has source-isolated CPU checks, compile checks, targeted pre-commit checks, and a full diff audit. The hardware results above directly qualify `555c6906` and `b8ea8032`, not `f560a3c7`. Refer to [PR #2160](https://github.com/sgl-project/sglang-omni/pull/2160) for the latest Validation section and checklist.
+The current head has source-isolated graph, environment-default, startup-contract, targeted pre-commit, and diff checks. The hardware results above directly qualify older heads `555c6906` and `b8ea8032`. A per-stream-queue experiment also reported 19/19 completed phases, median throughput `+0.8%`, and p95 `-0.5%`, but that result is not complete current-head qualification for `8fe0e163`. Refer to [PR #2160](https://github.com/sgl-project/sglang-omni/pull/2160) for the latest Validation section and checklist.
 
 Additional boundaries:
 
@@ -265,16 +241,16 @@ Additional boundaries:
 1. **Passing a few stress rounds does not establish root cause.** Moving work between threads, adding a lock, or changing streams may only alter failure probability.
 2. **Device streams and Host submission queues must be analyzed separately.** Isolation of one does not imply isolation of the other.
 3. **`non_blocking=True` is not an absolute asynchronous guarantee.** Host-memory type and runtime implementation still matter.
-4. **A future's completion contract must match downstream usability.** "Submitted" and "ready to consume" are different states.
-5. **A durable fix removes the invalid dependency instead of accumulating synchronization.** The key was reclaiming device-work ownership, not adding another lock.
+4. **Host-queue topology must match the multi-stream submission model.** After isolating device streams, verify whether their Host work still enters one queue.
+5. **A durable fix removes the invalid dependency instead of accumulating synchronization.** The final design uses per-stream Host queues instead of adding a transfer worker or global lock.
 6. **Error codes and silent stalls need separate evidence chains.** They share an ownership problem, but they are not one failure.
-7. **Implementation, tests, and documentation should express the same completion contract.** The component that submits device work should own its lifetime, completion signal, and failure handling.
+7. **Implementation, tests, and documentation must describe the same current contract.** A reverted experimental design must not remain in the PR description or architecture write-up.
 
 The redesign ultimately clarified three boundaries:
 
 ```text
-who owns device submission
-who decides when a request may advance
+who owns encoder graph updates
+how device streams map to Host submission queues
 who owns the complete graph-update transaction lifecycle
 ```
 
