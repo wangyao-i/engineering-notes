@@ -1,0 +1,632 @@
+# Qwen3-ASR-1.7B 在昇腾 A3 上的阶段性性能优化实践
+
+> 状态：草案（未对外发布）。文中 `待补` 表示当前材料不足以支撑结论，需补齐测量后再填。
+
+## 1. 摘要
+
+本文记录 Qwen3-ASR-1.7B 在 Atlas 900 A3（Ascend 910C，单卡 2 die）上的阶段性优化实践（涉及**两组配置**：可复现的「参考配置」与延迟更低的「调优配置」，全文分别标注）：目标是在 10 秒音频、约 70 路并发的条件下把端到端识别延迟压到可控范围。目前有三组已测结论（两组负载 + 一组质量）：
+
+- **单 die、双实例，固定约 7 req/s 开环**：420 请求，**p50 462.2 ms、p95 497.5 ms、p99 547.5 ms**，完成吞吐 6.97 req/s。
+- **识别质量（参考配置，seedTTS 全量，官方归一化）**：中文 **CER 0.611%**、英文 **WER 1.211%**（2020 / 1088 条，并发 8，失败 0、空文本 0）。
+- **稳定性（单 die，参考配置）**：中文 10,007 请求 / 22.0 min、英文 10,007 请求 / 23.8 min，全程**零失败**，吞吐 7.58 / 7.01 req/s。
+- **8 die、16 实例，闭环并发 70**：1400 请求，**135.04 req/s**，**p50 489.1 ms、p95 623.2 ms、p99 735.1 ms**；HTTP 成功 1400/1400，解析失败 0、空文本 0、已检查的退化模式 0。
+
+范围说明：
+
+1. 上述**负载结果**基于固定 10 秒循环拼接音频、预热后的测量；识别质量另见 §4.5（seedTTS 全量、官方归一化：中文 CER 0.611%、英文 WER 1.211%）。负载与质量评测使用**不同音频**（前者为循环拼接片段，后者为 seedTTS 合成语音），因此不能合并成同一个「准确率结论」。
+2. 全文涉及**两组配置**（参考配置：LM eager；调优配置：decode 图开启）与多种部署规模，各自的数字只在同组内比较，**不构成前后对比，也不能相互推算扩展效率**。
+
+## 2. 测试环境与方法
+
+| 项 | 值 |
+|---|---|
+| 硬件 | Atlas 900 A3 SuperPoD 计算节点；8 卡 × 2 die = 16 die；单 die HBM 64 GB |
+| 实例形态 | 每个 die 部署 2 个实例（同一 die 上第三个实例会被驱动拒绝） |
+| sglang-omni | 0.1.9，main `72b776c9ce41c794e74fa609266915ad229bea3c` |
+| SGLang / PyTorch | 0.5.22 / 2.10.0 |
+| torch_npu / CANN | 2.10.0.post6 / 9.1.0 |
+| driver / firmware | 25.5.0 / 7.8.0.5.216 |
+| 模型 / dtype | Qwen3-ASR-1.7B；dtype=`auto`（**仅确认 auto，未单独验证 bf16**） |
+| 音频 | 10 s、单声道、16 kHz、PCM16 WAV（320,044 B）；由仓库示例音频循环拼接而成，全部请求复用同一文件 |
+| 压测客户端 | 与推理服务同机（localhost），Python stdlib `urllib`，无外部网络跳转 |
+
+### 2.1 版本锚点（代码与脚本身份）
+
+| 项 | 值 |
+|---|---|
+| sglang-omni | 0.1.9，git `72b776c9ce41c794e74fa609266915ad229bea3c`，tracked 树干净（仅未跟踪的运行产物） |
+| sglang | 0.5.22（镜像内置） |
+| torch / torch_npu | 2.10.0 / 2.10.0.post6 |
+| CANN / driver / firmware | 9.1.0 / 25.5.0 / 7.8.0.5.216 |
+| 容器镜像 | `sglang-omni:main-cann9.1.0-a3`（**镜像 digest 未记录**；跨环境复现以本表版本号为准） |
+| 容器形态 | 特权模式 + host 网络 + 映射 NPU 驱动目录与权重目录 |
+
+压测/评测脚本 sha256（前 16 位，完整值见 `MANIFEST.txt`）：
+
+| 脚本 | 字节 | sha256(16) |
+|---|---:|---|
+| `bench/bench_rr.py`（v2，响应采集） | 10,882 | `2e854eb51f5617e2` |
+| `bench/openloop_asr.py` | 3,874 | `19da8b3f00615a0c` |
+| `tools/summarize.py` | 5,415 | `75408d9179dbce90` |
+| `tools/eval_cer.py` | 6,063 | `f887d6b4e0985061` |
+| `tools/audit_cer.py` | 5,085 | `d18343213cbb524c` |
+| `bench/affinity_ab.sh` | 2,339 | `6e78dd742da852f3` |
+| `bench/numa_bind_test.sh` | 3,194 | `ecf6c17e5a6d2f49` |
+| `deploy/deploy_single_die.sh` | 1,935 | `f9baef00b1712ec3` |
+| `deploy/serve_4c8d.sh` | 2,390 | `ae2ebaccb6733e62` |
+| `deploy/run_sglang_omni.sh` | 2,018 | `1dea8dc43525c48d` |
+
+数据与音频由使用者自行准备（本文不附带）：
+
+- 质量评测：seedTTS 中文 2020 条 / 英文 1088 条；参考文本取数据集 `meta.lst` 的**第 2 列**（口语文本），第 4 列与音频无关
+- 性能负载：10 s、单声道、16 kHz、PCM16 WAV（约 320 KB），由仓库示例语音循环拼接；**拼接方式会影响输出 token 数进而影响延迟**，换音频后需重新记录基线
+
+两种负载用例：
+
+| 用例 | 发压方式 | 主要回答的问题 |
+|---|---|---|
+| 固定速率开环 | 按固定节奏提交（70 streams / 10 s ⇒ 约 7 req/s），**不等前一个请求完成** | 给定业务到达率下的延迟 |
+| 闭环并发 | 固定 worker 数（70），**完成即补下一个** | 给定并发下的吞吐与延迟 |
+
+表格规范：下文所有对比表均为三线表（表头顶线 / 表头下中线 / 表底底线，表体不画竖线）；在 Markdown 渲染下以管道表为准，正式排版时可一键转换为三线表。
+
+配置口径（全文两组配置，不跨组做倍数换算）：
+
+| 配置 | encoder 图 | LM prefill/decode 图 | 用途 |
+|---|---|---|---|
+| **参考配置** | 开启 | **关闭（eager）** | 性能矩阵、质量、稳定性（可复现基线） |
+| **调优配置** | 开启 | **decode 图开启**（FIA 路径） | 延迟/吞吐对比（§4.2 图 vs 非图） |
+
+统计规则（负载）：
+
+- 预热请求全部排除，且预热后等待各实例 `pending_completions == 0` 才起压
+- 端到端延迟：从请求发出到**完整响应体读取完毕**
+- 吞吐：`请求数 / (最后完成时刻 − 首个正式请求发送时刻)`
+- 分位数：升序排序 + 线性插值；默认样本为全部已完成请求
+
+统计规则（质量）：
+
+- 串行口径（并发 1）用于衡量模型能力；并发 32 口径用于衡量服务端到端表现，二者分开报告
+- 语料级 = 总错误字符（词）/ 总参考字符（词）；句均 = 各样本错误率均值
+- 归一化：NFKC + lower case；中文去空白与标点后按字符级编辑距离，英文去标点后按词级编辑距离
+
+- 预热请求全部排除，且预热后等待各实例 `pending_completions == 0` 才起压
+- 端到端延迟：从请求发出到**完整响应体读取完毕**（含上传、排队、推理、响应传输）
+- 吞吐：`请求数 / (最后完成时刻 − 首个正式请求发送时刻)`
+- 分位数：升序排序 + 线性插值；默认样本为「全部已完成请求」
+- 逐请求字段与脚本参数见复现包说明（§5）
+
+## 3. 优化过程
+
+请求链路：
+
+```text
+HTTP 请求 → 音频预处理 / Encoder → LM Prefill → LM Decode → 返回文本
+```
+
+### 3.1 FIA 与 decode 图
+
+**问题**：默认 NPU 解码后端走 ATB 的 `_npu_paged_attention`。启用 decode 图捕获时，ATB 在 setup 阶段需要从 Host 内存构建参数，ACL 捕获以 `107033`（`ACL_ERROR_STREAM_TASK_GROUP_STATUS`）失败。
+
+**改动**：改用 FIA 路径（`ASCEND_USE_FIA=1`，解码调用 `npu_fused_infer_attention_score`），同时关闭 dynamo 追踪（`TORCHDYNAMO_DISABLE=1`，避免 triton-ascend 的设备查询触发 dynamo skip），使 decode 图可以捕获。
+
+**结果（全文统一口径：图模式 vs 非图模式，同 FIA 路径）**：
+
+| 指标 | 非图模式（decode 图关闭） | 图模式（decode 图开启） | 增益（图 vs 非图） |
+|---|---|---|---|
+| 吞吐 | 48.8 / 51.0 req/s | 130.5 / 129.8 req/s | **×2.55–2.67** |
+| p50 | 1259 / 1270 ms | 491 / 511 ms | **−60%（约 0.40×）** |
+| p95 | 1644 / 1546 ms | 568 / 600 ms | **−62%～−65%** |
+
+> 条件：8 die / 16 实例、闭环并发 70、各 700 请求 × 2 轮、同 SHA、同预热流程。
+> 整组配置（FIA + 图 + pre-LM + coalesce 一并变化）的单请求对比见 §4.1，**不与本表混算**。
+> 「更换 attention 路径（ATB→FIA）」本身的单独收益未拆分（本轮 FIA 与图始终同时变更），列为遗留问题（见 §7）。
+
+### 3.2 关闭 pre-LM encoder 路径
+
+**它实际改变什么**：`enable_pre_lm_encoder` 控制一个独立的「前置编码服务」（队列 + 线程池，负责把音频编码成 embedding，并带 embedding 缓存与自有批处理）。开启时编码在独立 NPU stream 上与 LM 重叠；关闭后编码回到 LM 阶段的执行链路内。
+
+**代价与约束**：pre-LM 开启且任一图开启时，NPU 要求 `PER_STREAM_QUEUE=1`、`TASK_QUEUE_ENABLE` 未设或为 1、`ASCEND_LAUNCH_BLOCKING` 不设为 1，否则启动被拒绝。关闭 pre-LM 可避开这条约束，且 **encoder 图仍会捕获**（由独立的 `enable_encoder_cuda_graph` 控制）。
+
+**结果**：
+
+| 配置 | p50（单 die × 2 实例，闭环并发 5） |
+|---|---|
+| pre-LM encoder 关闭 | 358 ms |
+| pre-LM encoder 开启（默认） | 495 ms |
+
+> 该对照**只有单轮观察值、无 run 目录与 CSV**，仅作配置取舍依据，不作为对外收益数字；高并发持续流形态下是否仍然更优：`待补`。
+
+### 3.3 coalesce 等待时间
+
+**取舍**：prefill 批处理需要等待窗口，默认 `prefill_coalesce_wait_ms=40`。该等待会直接叠加到每个请求的延迟上，而 prefill 本身仅约 25–35 ms。
+
+**改动**：把等待降到 10 ms、同批次上限提到 32。
+
+**结果**：8 die / 16 实例、闭环并发 70、各 700 请求、同一 SHA、同一预热流程下的配对测量（各 2 轮）：
+
+| wait_ms | p50 | p95 | 吞吐 |
+|---|---|---|---|
+| 10 | 491 / 511 ms | 568 / 600 ms | 130.5 / 129.8 req/s |
+| 40（默认） | 521 / 571 ms | 577 / 675 ms | 125.6 / 117.8 req/s |
+
+即 40 ms 相比 10 ms 使 p50 增加约 45 ms、吞吐下降约 7%（两轮均值口径）。drop 到 10 ms 的代价是批次变小，但本例中未见吞吐损失。
+
+### 3.4 每 die 双实例
+
+**动机**：按「并发 N」口径压测时，单实例会让批次变大、decode step 变长；把每个 die 拆成两个实例可让每个实例的在途请求数减半。
+
+**约束**：第三个实例会被驱动拒绝（`SetDevice` 507033 / `Alloc Stream` 失败），因此单机实例数上限 = die 数 × 2。
+
+**结果**：8 die、闭环并发 70、各 700 请求（各 2 轮）：
+
+| 每 die 实例数 | p50 | p95 | 吞吐 |
+|---|---|---|---|
+| 2 实例（16 实例） | 491 / 511 ms | 568 / 600 ms | 130.5 / 129.8 req/s |
+| 1 实例（8 实例） | 434 / 441 ms | 814 / 846 ms | 124.4 / 128.0 req/s |
+
+观察：单实例的 p50 更低（批次更小），但 p95 明显恶化（约 +245 ms），吞吐基本持平。也就是说双实例在这个负载下换来的是**尾延迟更可控**，而不是吞吐提升。
+
+### 3.5 最少在途请求分发
+
+**与轮询的区别**：轮询按请求序号分配，瞬时分配可能不均；「最少在途」按各实例当前在途数选择，压小瞬时批次。
+
+**结果**：同部署（8 die / 16 实例）、同负载（闭环并发 70、700 请求）下切换分发策略：
+
+| 分发策略 | p50 | p95 | 吞吐 |
+|---|---|---|---|
+| 轮询 rr | 635 ms | 865 ms | 98.5 req/s |
+| 最少在途 pending | 511 ms | 600 ms | 129.8 req/s |
+
+最少在途使 p50 降低约 124 ms、吞吐提升约 32%，差异主要来自轮询把请求堆到同一实例导致批次变大。
+
+### 3.6 CPU 线程与亲和性（含 NUMA 对齐）
+
+**三种绑核方式对比**（同一 16 实例部署、闭环 70、各 2 轮，取中位数）：
+
+| 指标 | 不绑核（0–639） | 简单绑核（每实例 20 核切片） | NUMA 对齐绑核（每节点 4 实例 × 40 核） |
+|---|---|---|---|
+| p50 | 491.7 ms | 490.0 ms | 499.2 ms |
+| p95 | 574.0 ms | 566.5 ms | 548.8 ms |
+| 吞吐 | 130.53 req/s | 131.72 req/s | 131.48 req/s |
+| 吞吐增益 | — | **+0.9%** | **+0.7%** |
+
+**结论：三种方式都在波动范围内，无显著收益。** 绑核只能作为隔离干扰的部署选项，不能宣称性能提升；NUMA 对齐仅让 p95 略降约 25 ms，不足以作为优化项。
+
+#### 实现细节与参考
+
+本次 NUMA 绑核参考了两处上游实现：
+
+| 来源 | 做法 | 我们用到的部分 |
+|---|---|---|
+| vllm-ascend `vllm_ascend/cpu_binding.py` | 按设备代际选模式：A2/A5/310P 用 `topo_affinity`，**A3 用 `global_slice`**；并有 `MIN_CPUS_PER_NPU=5`（IRQ 2 + main 1 + acl 1 + release 1）约束 | A3 采用 global slice（按 NUMA 节点切 CPU 段），实例独占一段 |
+| sglang `srt/utils/numa_utils.py` | `SGLANG_NUMA_BIND_V2`（默认 True）下用 numactl 前置到子进程，`get_cpu_ids_by_node` 取节点 CPU | 思路参考；NPU 侧未启用（依赖 CUDA/NVML 路径） |
+
+我们的实现（`numa_bind_test.sh`）：
+
+```bash
+# 16 实例 -> 4 个 NUMA 节点，每节点 4 实例，每实例独占该节点 40 核
+for i in $(seq 0 15); do
+  port=$((8100+i)); node=$(( i % 4 )); slot=$(( i / 4 ))
+  mapfile -t cpus < <(node_cpus "$node")          # 读 /sys/devices/system/node/node*/cpulist
+  slice=$(printf "%s," "${cpus[@]:$((slot*40)):40}" | sed 's/,$//')
+  pid=$(docker exec sglang-omni pgrep -f "port $port" | head -1)
+  docker exec sglang-omni taskset -apc "$slice" "$pid"
+done
+```
+
+#### 为什么收益有限（以及本次绑核的边界）
+
+| 项 | 实际做法 | 是否覆盖 |
+|---|---|---|
+| CPU 绑定 | `taskset -apc` 绑定实例主进程全部线程 | ✅ |
+| NUMA 对齐 | 实例 CPU 落在单一 NUMA 节点内（每节点 4 实例） | ✅ |
+| **内存 NUMA 策略** | 未显式 `membind`（机器与容器内均无 `numactl` 可执行文件）；依赖默认 local 分配 | ❌ |
+| **NPU die ↔ NUMA 真实拓扑** | 无法获取：本机 8 张 NPU 卡的 PCIe `numa_node` 均为 `-1`，只能按 `node = 卡序号 % 4` 约定映射 | ❌ |
+| IRQ / 网卡亲和 | 未调整 | ❌ |
+| 线程数精调 | 仅 `OMP_NUM_THREADS=8` | 部分 |
+
+本机拓扑：640 逻辑核、4 个 NUMA 节点（各 160 核）、4 颗 CPU、16 个 NPU die。
+
+**因此这条结论的准确表述是**：「在 NPU 无 NUMA 拓扑信息、且未做内存绑定的前提下，CPU 侧 NUMA 对齐绑核无显著收益」。真正的 NPU↔NUMA 亲和需要硬件拓扑信息（PCIe 根桥所属节点）与 `numactl` 支持，本轮不具备条件。
+
+## 4. 性能结果与对比
+
+### 4.1 整组配置的并发扫描（非单一特性对比）
+
+> 本节对比的是**整组配置**（FIA、decode 图、pre-LM、coalesce 同时变化），增益**不可归因于任何单项**；单项特性统一按配对口径（图 vs 非图、coalesce 40 vs 10）统计，见 §4.2。
+
+**同一部署形态（单 die × 2 实例）下的并发扫描**，每种并发跑 3 轮，表中为中位数（括号内为 3 轮范围）。
+
+- **基线**：NPU 可运行基线 —— ATB 解码（`ASCEND_USE_FIA=0`）、decode 图关闭、pre-LM 保持默认开启、coalesce 默认
+- **调优**：FIA 解码 + decode 图开启、pre-LM 关闭、coalesce 10 ms/32
+
+| 并发 | 基线吞吐 | 调优吞吐 | 基线 p95 | 调优 p95 | 响应异常 |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 0.90 req/s（0.86–0.95） | 3.75 req/s（3.48–3.79） | 1230 ms（1115–1240） | 305 ms（276–348） | 0 / 0 |
+| 8 | 6.68 req/s（6.62–6.76） | 17.5 req/s（17.1–17.8） | 1301 ms（1261–1319） | 472 ms（460–498） | 0 / 0 |
+| 32 | 13.55 req/s（13.41–13.71） | 28.5 req/s（28.4–28.6） | 2574 ms（2503–2606） | 1167 ms（1159–1187） | 0 / 0 |
+
+补充：单请求（并发 1）延迟从基线 **1050–1169 ms** 降至调优 **261–274 ms**；所有运行的 HTTP 请求均为全部成功（40 / 160 / 640）。
+
+> 说明：两列的差异是**整组配置差异**（FIA、decode 图、pre-LM、coalesce 同时变化），不能拆成单项收益；单项配对见 4.2。
+> 本轮未做 70 并发下的单 die 扫描（单 die 吞吐上限约 28 req/s，70 并发会进入排队区）；曲线图暂不生成。
+
+### 4.2 单项特性对比（统一按配对增益统计）
+
+#### 4.2.1 图 vs 非图（同 FIA 路径）
+
+| 指标 | 非图模式 | 图模式 | 增益（图 vs 非图） | 运行 ID |
+|---|---|---|---|---|
+| 吞吐 | 48.8 / 51.0 req/s | 130.5 / 129.8 req/s | **×2.55–2.67** | decodeoff / base+p4 |
+| p50 | 1259 / 1270 ms | 491 / 511 ms | **−60%** | 同上 |
+| p95 | 1644 / 1546 ms | 568 / 600 ms | **−62%～−65%** | 同上 |
+
+条件：8 die / 16 实例、闭环并发 70、各 700 请求 × 2 轮、同 SHA；运行目录 `gap-decodeoff-pending-c70(-b)`、`gap-base-pending-c70`、`gap-p4-pending-c70`。
+
+#### 4.2.2 coalesce 等待（其余配置相同）
+
+| 指标 | 40 ms（默认） | 10 ms | 增益（10 vs 40） | 运行 ID |
+|---|---|---|---|---|
+| 吞吐 | 117.8 / 125.6 req/s | 130.5 / 129.8 req/s | **+3.3%～+10.7%** | co40 / base+p4 |
+| p50 | 571 / 521 ms | 491 / 511 ms | **−1.9%～−14.1%** | 同上 |
+| p95 | 675 / 577 ms | 568 / 600 ms | −15.7%～+3.9%（方向不一致） | 同上 |
+
+> 若后续只能整体开关全部图（encoder/prefill/decode），应命名为「整体图模式对比」，不得把全部收益归因于 decode 图。
+
+#### 4.2.3 encoder 图 vs eager（参考配置，单 die）
+
+| 测点 | encoder 图 | encoder eager | 增益（图 vs eager） |
+|---|---|---|---|
+| zh-c8 吞吐 | 8.391 req/s | 8.124 req/s | **×1.033** |
+| zh-c8 p50 / p95 | 944.3 / 1221.5 ms | 936.9 / 1274.8 ms | p50 −0.8%、p95 **−4.2%** |
+| en-c1 吞吐 | 1.888 req/s | 1.837 req/s | **×1.028** |
+| en-c1 p50 / p95 | 530.7 / 693.1 ms | 539.4 / 736.1 ms | p50 +1.6%、p95 **−5.8%** |
+
+- 各 3 轮取中位数；两臂输出一致性抽查：zh 99/100、en 100/100 完全相同（zh 唯一差异是标点位置）
+- 结论：encoder 图主要改善**尾延迟**（p95 −4%～−6%），吞吐提升 2.8%～3.3%，p50 基本不变
+
+### 4.3 当前部署案例
+
+| 用例 | 资源 | 负载 | 脚本版本 | 请求数 | 吞吐 | p50 / p95 / p99 | 响应有效性 |
+|---|---|---|---|---|---|---|---|
+| A（开环） | 1 die × 2 实例 | 固定 ≈7 req/s，持续 60 s | v1（仅 HTTP 状态） | 420 | 6.97 req/s | 462.2 / 497.5 / 547.5 ms | HTTP 成功 420/420；文本未采集 |
+| B-v2（闭环并发 70） | 8 die × 16 实例 | 70 worker 完成即补 | v2（HTTP+解析+文本） | 1400 | 135.04 req/s | 489.1 / 623.2 / 735.1 ms | HTTP 1400/1400；解析失败 0；空文本 0；已检查退化 0 |
+
+> 两行资源与负载口径不同，**不得据此计算扩展效率**。
+
+### 4.4 历史结果
+
+历史上曾记录「优化后 145–147 req/s」。它与本轮 16 实例的 135.04 req/s 差异来自四处，**不是精度回退**：
+
+| 维度 | 历史 145–147 req/s | 本轮 B-v2 135.04 req/s |
+|---|---|---|
+| 实例规模 | 15 die × 2 = 30 实例 | 8 die × 2 = 16 实例 |
+| 每实例吞吐 | ≈ 4.8–4.9 req/s | ≈ 8.4 req/s |
+| coalesce | 默认（wait 40 / req 16） | wait 10 / req 32 |
+| 压测脚本 | v0/v1：仅记录 HTTP 状态 | v2：读满响应体 + JSON 解析 + CSV 落盘 |
+| 吞吐窗口 | 脚本内 `ThreadPoolExecutor` 段 | CSV「首发 → 末完成」 |
+
+即：实例数减半使总吞吐下降，但**每实例效率反而提升约 75%**；同时 v2 的响应采集带来额外开销。因此两组数字不可直接比较谁"更好"。
+
+内部记录中还有两组更早的数字（未优化基线 56.2 req/s、优化后 145–147 req/s；单请求 1161 ms → 248 ms）。这些数字**只有报告摘录，没有逐请求原始数据与完整配置**，因此：
+
+- 不作为本文的核心收益结论
+- 不参与任何倍数换算（本文不对历史数字与本轮结果做「提升 N 倍」的表述）
+- 若后续需要引用，应在对比表中标注「报告摘录」并补齐条件后再评估
+
+同样，旧闭环结果（138.1 req/s，仅 HTTP 状态检查）与 B-v2（135.04 req/s，含响应采集）**不可拼接**成同一结论：脚本版本不同，采集开销也不同。
+
+未对齐的外部对比（如 H100 倍数、910B 等效折算）本文不纳入。
+
+### 4.5 识别质量（CER / WER）
+
+**参考配置**（encoder 图开启、LM eager）、seedTTS 全集、并发 8、官方评分归一化（`benchmarks.tasks.asr.normalize_text`；英文用 whisper `EnglishTextNormalizer`）：
+
+| 数据集 | 样本数 | 指标 | 语料级 | 句均中位 | 退化样本（>20%） | 失败 / 空文本 |
+|---|---|---|---|---|---|---|
+| seedTTS-ZH | 2020 | CER | **0.611%**（204/33370） | 0% | 2 | 0 / 0 |
+| seedTTS-EN | 1088 | WER | **1.211%**（160/13216） | 0% | 0 | 0 / 0 |
+
+说明与核查：
+
+- 评分脚本与归一化沿用仓库官方实现，数字与社区同数据集基线（EN WER 1.22–1.30%）可比
+- **数据集本身存在重复音频**：zh 2020 条中仅 1010 个唯一音频、en 1088 条中 666 个唯一音频；因此语料级指标对重复样本按原样计入，未做去重加权
+- 早期自写归一化（NFKC + 去标点）与并发 32 的口径下，我们曾得到 zh 1.67% / en 1.66%（串行）与 2.13% / 2.34%（并发 32）；差异主要来自归一化规则（分母口径）与并发下的偶发退化，**不与本表混用**
+- 局限：seedTTS 为 TTS 合成语音（干净、单人、无噪声），不代表真实嘈杂/远场/方言场景
+
+### 4.6 稳定性（参考配置，单 die）
+
+| 数据集 | 请求数 | 时长 | 吞吐 | p50 | p95 | 失败 | 空文本 |
+|---|---|---|---|---|---|---|---|
+| seedTTS-ZH | 10,007 | 22.02 min | 7.575 req/s | 916.8 ms | 2648.4 ms | 0 | 0 |
+| seedTTS-EN | 10,007 | 23.79 min | 7.010 req/s | 973.4 ms | 2974.8 ms | 0 | 0 |
+
+10 分钟窗口稳定性（吞吐，req/s）：
+
+| 数据集 | 窗口 1 | 窗口 2 | 窗口 3（尾段） |
+|---|---|---|---|
+| ZH | 7.463 | 7.663 | 7.629（121 s） |
+| EN | 6.732 | 7.217 | 7.180（227.6 s） |
+
+- 两个数据集在全长运行中均无失败、无空文本，吞吐无明显衰减（EN 首窗口略低，随后回升）
+
+### 4.7 参考配置性能矩阵（单 die，3 轮中位数）
+
+| 数据集 | 并发 | 吞吐 req/s | audio-s/s | p50 | p95 | 失败 |
+|---|---:|---:|---:|---:|---:|---:|
+| ZH | 1 | 2.064 | 10.47 | 474.0 ms | 641.5 ms | 0 |
+| ZH | 4 | 4.971 | 25.21 | 771.5 ms | 1036.5 ms | 0 |
+| ZH | 8 | 8.406 | 42.64 | 898.0 ms | 1215.7 ms | 0 |
+| EN | 1 | 1.859 | 9.42 | 532.0 ms | 704.9 ms | 0 |
+| EN | 4 | 4.626 | 23.44 | 841.9 ms | 1074.7 ms | 0 |
+| EN | 8 | 8.306 | 42.09 | 939.0 ms | 1241.4 ms | 0 |
+
+按音频时长分桶（ZH-c8 中位数）：短（4.0–4.5 s）mean 847.6 / p95 1056.9 ms；中（4.5–5.5 s）920.4 / 1200.4 ms；长（5.5–8.5 s）994.7 / 1230.2 ms。EN-c8 对应为 797.1/1006.1、957.1/1171.3、1037.7/1284.0 ms。
+
+资源：每实例 NPU 进程内存峰值约 16.2 GB，HBM 峰值约 19.0 GB（`mem-fraction-static=0.25`）。
+
+> 注意：本表为**参考配置（LM eager）**，单请求延迟高于调优配置（§4.1 中 zh 单请求 p50 261–274 ms）；两组配置不可跨表比较。
+
+## 5. 复现
+
+### 5.1 目录结构
+
+```text
+qwen3-asr-a3-perf/
+  README.md
+  deploy/
+    run_sglang_omni.sh          # 容器启动（特权 / host 网络 / NPU 设备与驱动挂载）
+    deploy_single_die.sh        # 单 die × 2 实例
+    serve_4c8d.sh               # 8 die × 2 = 16 实例
+    serve_refcfg.sh             # 参考配置单实例（encoder 图开、LM eager）
+  bench/
+    bench_rr.py                 # 闭环并发（v2：读满响应体并解析）
+    bench_rr.py.orig            # 未采集版（对照）
+    openloop_asr.py             # 固定速率开环
+    affinity_ab.sh              # 绑核 / 不绑核 A/B
+    numa_bind_test.sh           # NUMA 对齐绑核 A/B
+  tools/
+    summarize.py                # 响应有效性 + 分位 + 吞吐
+    eval_cer.py                 # CER / WER 评测（含归一化规则）
+    audit_cer.py                # 参考对齐 / 可复现性 / 端口依赖核查
+  results/
+    example_summary.json
+    EVIDENCE_INDEX.md           # 每条证据的文件路径 + 大小 + sha256
+```
+
+### 5.2 环境变量（完整清单)
+
+必需（每行独立执行；不要在行尾加续行符）：
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=<die_id>               # 每实例绑定一个 die
+export ASCEND_USE_FIA=1                                 # 解码走 FIA，decode 图才可捕获
+export TORCHDYNAMO_DISABLE=1                            # 绕过 triton-ascend 的 dynamo skip
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True  # 抑制显存碎片
+export OMP_NUM_THREADS=8                                # 默认值会取到很大的核数
+export SGLANG_OMNI_STARTUP_TIMEOUT=1800                 # 图捕获耗时较长
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+```
+
+队列相关（NPU 图路径隐含要求，手工启动实例时容易漏）：
+
+```bash
+export PER_STREAM_QUEUE=1          # pre-LM 开启 + 任一图开启时必须为 1，否则启动被拒
+export TASK_QUEUE_ENABLE=1         # 不设或设为 1；设为 0 会让图路径不可用
+unset ASCEND_LAUNCH_BLOCKING       # 或设为 0；设为 1 会禁用图路径
+```
+
+其它环境注意：
+
+- 容器内 `/tmp` 可能因宿主磁盘紧张而不可写 —— 日志与中间产物一律写挂载目录
+- 若宿主 `/home`（Docker data-root）已满，容器内 Python 会报 `No usable temporary directory found`
+
+### 5.3 服务启动参数（两组配置）
+
+**参考配置**（性能矩阵 / 质量 / 稳定性所用；encoder 图开启，LM prefill/decode eager）：
+
+```bash
+sgl-omni serve \
+  --model-path "$MODEL_PATH" --model-name Qwen3-ASR-1.7B \
+  --mem-fraction-static 0.25 \
+  --asr.engine.max_running_requests 8 \
+  --asr.engine.cuda_graph_max_bs 8 \
+  --asr.factory.enable_pre_lm_encoder false \
+  --asr.factory.enable_torch_compile false \
+  --asr.engine.cuda_graph_backend_prefill disabled \
+  --asr.engine.cuda_graph_backend_decode disabled \
+  --host 0.0.0.0 --port "$PORT"
+```
+
+**调优配置**（§4.2 图 vs 非图对比所用；decode 图开启走 FIA 路径，coalesce 调至 10/32）：
+
+```bash
+sgl-omni serve \
+  --model-path "$MODEL_PATH" --model-name Qwen3-ASR-1.7B \
+  --mem-fraction-static 0.25 \
+  --asr.engine.max_running_requests 8 \
+  --asr.engine.cuda_graph_max_bs 8 \
+  --asr.factory.enable_pre_lm_encoder false \
+  --asr.factory.enable_torch_compile false \
+  --asr.factory.prefill_coalesce_wait_ms 10 \
+  --asr.factory.prefill_coalesce_requests 32 \
+  --host 0.0.0.0 --port "$PORT"
+```
+
+要点：
+
+- 每 die 起 2 个实例，端口 8100–8115（8 die）
+- encoder 图由 `enable_encoder_cuda_graph`（默认 True）控制，两组配置都开启
+- NPU 可运行基线对照：`ASCEND_USE_FIA=0` + decode 图 disabled + `enable_pre_lm_encoder` 保持默认 true + coalesce 默认
+
+### 5.4 容器与部署
+
+容器启动（关键参数，完整脚本见 `deploy/run_sglang_omni.sh`；驱动路径按实际环境替换）：
+
+```bash
+docker run -d --name sglang-omni --privileged --network host --ipc host \
+  -v /home:/home \
+  -v /vendor/ascend/driver:/usr/local/Ascend/driver \
+  -v /vendor/ascend/dcmi:/usr/local/dcmi \
+  -v /data:/data \
+  --device=/dev/davinci0 --device=/dev/davinci1   # ... 直到 davinci15 \
+  --device=/dev/davinci_manager --device=/dev/devmm_svm --device=/dev/hisi_hdc \
+  <镜像> sleep infinity
+```
+
+单 die × 2 实例：
+
+```bash
+bash deploy/deploy_single_die.sh 1 8100        # die=1，端口 8100/8101 \
+curl -s http://127.0.0.1:8100/health
+```
+
+8 die × 2 = 16 实例（die i → 端口 `8100+2(i−1)` 与 `8101+2(i−1)`，即 8100–8115）：
+
+```bash
+bash deploy/serve_4c8d.sh                      # 端口 8100-8115 \
+for p in $(seq 8100 8115); do curl -s http://127.0.0.1:$p/health; done
+```
+
+> 部署脚本必须**先停旧实例**（`pkill -f "sgl-omni serve"` 并等待退出），否则旧实例占端口会造成新旧混跑 —— 复现时踩到过一次，表现为单请求延迟异常升高。
+
+### 5.5 健康检查与预热
+
+```bash
+# 健康检查（全部实例必须 healthy 再压测）
+for p in $(seq 8100 8115); do
+  curl -s --noproxy '*' -m 2 "http://127.0.0.1:$p/health" | grep -q healthy && echo "$p up"
+done
+
+# 预热：每实例 1 个请求，不计入统计
+for p in $(seq 8100 8115); do
+  curl -s -o /dev/null -X POST "http://127.0.0.1:$p/v1/audio/transcriptions" \
+    -F "file=@audio_10s.wav;type=audio/wav"
+done
+```
+
+### 5.6 压测命令
+
+开环（固定到达率，本文 A 组）：
+
+```bash
+RUN_CSV=/tmp/a.csv python3 bench/openloop_asr.py \
+  --ports 8100-8101 --streams 70 --duration 60 --audio audio_10s.wav
+```
+
+闭环并发（B 组与各配对实验）：
+
+```bash
+RUN_CSV=/tmp/b.csv python3 bench/bench_rr.py \
+  --ports 8100-8115 \
+  --lb pending \
+  --concurrency 70 --requests 1400 --seconds 10 \
+  --warmup-per-port 1
+```
+
+参数要点：
+
+- `--seconds` 只是**音频时长标注**（用于吞吐倍数换算显示），不控制压测持续时间；结束条件是 `--requests`
+- `--warmup-per-port 1` 让每端口各预热 1 次，预热写入独立文件、不计入统计；预热后等待各实例 `pending_completions == 0` 再起压
+- `RUN_CSV` 指向**本次运行独占**的文件；CSV 为追加写，复用文件会导致行数重复、吞吐分母失真
+
+### 5.7 汇总与质量评测
+
+```bash
+# 性能与响应有效性
+python3 tools/summarize.py /tmp/b.csv            # 人读
+python3 tools/summarize.py /tmp/b.csv --json     # 机器读
+
+# CER/WER（串行口径，模型能力）
+python3 tools/eval_cer.py --dataset /path/to/seedtts_zh_full --lang zh \
+  --ports 8100-8115 --concurrency 1 --out runs/cer-zh-serial
+
+# CER/WER（并发口径，服务端表现）
+python3 tools/eval_cer.py --dataset /path/to/seedtts_zh_full --lang zh \
+  --ports 8100-8115 --concurrency 32 --out runs/cer-zh
+
+# 质量结论核查（对齐 / 可复现性 / 端口依赖 / 并发效应显著性）
+python3 tools/audit_cer.py
+```
+
+归一化与参考文本口径：
+
+- 与社区可比的做法是沿用仓库官方 `benchmarks.tasks.asr.normalize_text`（中文逐字 token、英文 whisper `EnglishTextNormalizer`），本文 §4.5 采用该口径
+- 参考文本取自数据集 `meta.lst` 的**第 2 列**（口语文本）；第 4 列与音频无关，不可用
+- 若自行实现归一化，务必核对分母单位数（曾遇到「逐字加空格后再按 token 计数」导致分母翻倍、CER 被低估一半的情况）
+
+### 5.8 绑核与 NUMA 对齐
+
+```bash
+# 简单绑核：每实例 20 个连续 CPU
+i=0
+for port in $(seq 8100 8115); do
+  pid=$(docker exec sglang-omni pgrep -f "port $port" | head -1)
+  docker exec sglang-omni taskset -apc "$((i*20))-$((i*20+19))" "$pid"
+  i=$((i+1))
+done
+
+# NUMA 对齐绑核：实例 -> NUMA 节点 -> 该节点内独占 40 核
+bash bench/numa_bind_test.sh
+```
+
+注意：
+- 绑定对象是实例主进程的**全部线程**（`taskset -apc`）
+- 内存侧未做 `membind`；若环境有 `numactl`，建议同时加 `--membind=<node>`
+- 本机 NPU 的 PCIe `numa_node` 为 `-1`，无法做「die ↔ NUMA」真实对齐，只能按约定映射
+
+### 5.9 音频与发表前检查
+
+- 音频：当前使用仓库示例语音循环拼接为 10 s（16 kHz / 单声道 / PCM16）；若需公开独立音频，替换后必须重跑并重新标注结果
+- 发表前检查：部署失败是否退出、容器日志目录可写、端口未被占用、预热超时如何处理、每轮是否独立结果目录
+- 修改过的脚本必须保留原版与 diff；**新脚本不能声称是产生历史结果的原版**
+- 证据清单：数据包附带 `EVIDENCE_INDEX.md`（每个证据文件的路径 + 大小 + sha256），原始音频、转写与完整日志留在测量机，文章中只引用脱敏统计与哈希
+
+## 6. 关键踩坑
+
+**compile 配置覆盖**
+现象：CLI 传 `--asr.factory.enable_torch_compile false`，启动日志 profile 仍显示 `torch_compile=True`。
+证据：typed 配置默认值（`models/qwen3_asr/config.py` 中 `enable_torch_compile=True`）通过 `apply_typed_stage_kwargs` 覆盖 CLI 值；profile 打印取自最终 ServerArgs。
+建议：不要以 profile 字段判断是否编译；`TORCHDYNAMO_DISABLE=1` 时 dynamo 在 `torch/_dynamo/eval_frame.py` 直接返回空装饰器，编译被绕过。**这与 NPU 图捕获是两件事**（图仍会捕获）。
+
+**预热必须覆盖所有实例**
+现象：只预热部分实例就压测，未预热实例出现长尾（曾观测首轮 p95 ≈ 19 s）。
+建议：用 `--warmup-per-port` 逐实例预热，并以「各实例 pending 回到 0」作为排空判据；排空超时不能当作预热成功。首轮长尾的原因**尚未证实**（图捕获/首次 kernel 编译均只是推测），本文将其记为启动阶段异常，不作为稳态结论。
+
+**ATB 捕获失败要分阶段描述**
+现象：先是输入契约错误（`inTensor[4]` 维度为 0），修正 dtype/内存侧后仍失败，最终 `AclmdlRICaptureEnd` 返回 `107033`。
+建议：区分「参数不对」与「算子不可捕获」两类问题。**FIA 路径可捕获，并不能证明 ATB 在所有版本/场景下都不可捕获**。
+
+**数据集参考文本列可能不是"文本对应列"**
+现象：某评测集 `meta.lst` 有四列，第 4 列看似参考文本，但与音频内容完全无关；用它算出的 CER 偏低约一半。
+建议：换任何评测集先做对齐抽检（本文抽检 20 条，字符重合度均 > 0.8 才采信）；ASR 的参考文本应是「音频实际说的内容」，不是同目录里的另一段文本。
+
+**HTTP 成功不代表识别正确**
+现象：压测脚本的 success 只检查 HTTP 200；响应体可能为空或退化。
+建议：必须解析 JSON、检查文本非空，并统计已定义的退化模式；进一步判断准确率需要参考文本与 CER/WER（本文 §4.5 已给出 seedTTS 全集上的结果）。另外，循环拼接音频本身会造成重复文本，不能直接判为模型退化。
+
+**同一 flag 不能在不同参数组里重复传入**
+现象：公共参数已含 `--asr.factory.enable_pre_lm_encoder false`，对照实验又追加 `... true`，启动直接失败：
+`Invalid value: stages.asr.factory.enable_pre_lm_encoder is set twice at the same precedence (cli layer, explicit)`。
+建议：对照实验的变量要**先从公共参数里移除再单点设置**；否则会得到一次静默的无效部署（我们因此浪费了一轮基线部署）。
+
+**实时与离线分开验证**
+现象：WebSocket 实时路径在过载后会使该实例的离线接口返回退化文本，需重启恢复。
+建议：实时与离线隔离部署、分别验收；离线性能不能用来证明实时容量。
+
+（详细日志、探针脚本与逐阶段证据建议放独立 Issue 或附录，本文不展开。）
+
+## 7. 后续工作
+
+**Bugfix**
+
+1. **重复循环退化**：定位触发条件（并发相关、多数不可复现），验证解码侧抑制（repetition penalty / no-repeat-ngram）能否把退化率从约 0.8% 降到 0.1% 量级。
+2. **实时路径状态污染**：过载后的实时会话会使该实例离线接口输出退化文本、只能重启恢复；补最小复现并提交上游 Issue。
+3. **ATB decode 图不可捕获（107033）**：整理错误链与 FIA 路径的行为差异，提交上游跟踪（本文不再展开）。
+
+**功能补齐**
+
+4. **用例补齐**：瞬时突发（barrier 同步发起）与 WebSocket 实时容量／过载恢复脚本，并入复现包统一入口。
+5. **质量评测扩展**：真实录音（嘈杂 / 远场 / 方言）上的 CER/WER，并给出去重加权口径（seedTTS 存在重复音频：zh 1010/2020、en 666/1088）。
