@@ -1,0 +1,569 @@
+# Qwen3-ASR on Ascend A3 —— 社区文章数据包（Qwen3-ASR-1.7B，第一篇）
+
+> 采集日期：2026-10-29（Asia/Shanghai）。代码与依赖在采集期间未变更。
+> 本文只覆盖**已验证的转录服务**（离线 `/v1/audio/transcriptions`）。全图（encoder/prefill/decode 全图）与 realtime 不在本篇宣称范围，列为后续验证方向。
+> 0.6B 模型未测试（权重不在环境中）；本篇所有数字仅针对 Qwen3-ASR-1.7B。
+> 配置对应上游 PR [#3199](https://github.com/sgl-project/sglang-omni/pull/3199) 的 A-only NPU profile（encoder 图开、LM eager、async decode 开、compile/radix 关）；本轮为「同配方、不同栈」的独立复现，对账见附录 C。
+
+## 0. 一句话结论与证据边界
+
+- 参考配置（PR #3199 A-only profile）在单 die 上可稳定提供离线转录：EN 全量 SeedTTS-Eval 1088 条语料 **corpus WER 1.20%**（159 错误 / 13233 词；PR 原文 159/13216 = 1.2031%），ZH 全量 2020 条 **corpus CER 0.61%**（__ZH_ERR__ 错误 / __ZH_REF__ 字；PR 原文 200/33370 = 0.5993%），失败与空输出均为 0。
+- 统一性能（固定输入清单、每单元 3 个独立服务进程轮次、每轮 100 正式请求）：见 §4（PR 配置下 C1/C4/C8 的 EN/ZH 吞吐与延迟）。
+- 稳定性（C8 混合长短音频，先到 60min 或 10000 请求）：见 §6。
+- 图路径归因：见 §7。结论是**encoder 图在两代表负载下未见稳定收益**（与历史会话 profiling 的「encoder 仅占 ~6% 时延」一致）；**LM decode 图路线在验证栈上存在识别回归，因此参考配置选择 LM eager**（PR #3199 明确声明）。
+- **没有证明什么**：不证明多卡/多机扩展性；不证明 24×7 生产稳定性；不证明其他 CANN/torch_npu/卡型；不证明全图或 realtime 路径；不与 GPU 平台做跨平台加速比结论（口径与硬件不同）。
+- 与 PR #3199 的关系：其原始材料（质量评测、接口检查、参考性能、before/A、资源监控）已核对并对账（附录 C）。**本轮数据是独立复现，不冒充 PR 的 exact-head 资格**；两者栈不同（CANN 9.1.0 vs 9.0、driver 25.5.0 vs 25.5.1、torch_npu 2.10.0.post6 vs 2.10.0、Python 3.12 vs 3.11），只能互相对照。
+
+## 1. 候选版本与环境身份（冻结）
+
+| 项 | 值 | 证据 |
+|---|---|---|
+| 上游参考 | PR [#3199](https://github.com/sgl-project/sglang-omni/pull/3199)（Open，celestial-micha），A-only profile：`examples/configs/qwen3_asr_1_7b_npu.yaml` | 本轮按其 YAML 等价配置启动（§2） |
+| sglang-omni | `72b776c9ce41c794e74fa609266915ad229bea3c`；tracked 树干净；未跟踪产物 `fusion_result.json`、`kernel_meta/`、`engine_builder.py.bak-guard`（与引擎文件同 sha，无 import） | `INVENTORY.md` §A；`git status --porcelain` |
+| 启动目录 | `/home/w00984239/sgl_work/sglang-omni`（容器内 `/workspace` 为旧镜像副本，差 30+ 文件；`PYTHONPATH` 末尾空项使 cwd 决定 import 版本） | refcfg REPORT §陷阱 |
+| 容器镜像 | `sglang-omni:main-cann9.1.0-a3`，image id `sha256:60b5d202612a7f7760f3469f0376eca59ae9342dacdbb0777f49567cfccec6f6`，`RepoDigests=[]`（本地构建） | `docker inspect` |
+| CANN / driver / firmware | CANN 9.1.0；driver 25.5.0；firmware 7.8.0.5.216 | INVENTORY §A |
+| Python 运行时 | torch 2.10.0+cpu；torch_npu 2.10.0.post6；sglang 0.5.22；sglang_omni 0.1.9；Python 3.12.13 | `pip show` / import 实测 |
+| 硬件 | Atlas 900 A3 SuperPoD（Ascend910，2 die/卡，64 GB/die）；本次只用 chip1（性能/稳定性）与 chip2（质量并行）；chip0 为他人 vLLM（未接触） | `npu-smi info` |
+| 模型 | Qwen3-ASR-1.7B，本地 `/home/weights/Qwen3-ASR-1.7B`，HF revision `7278e1e70fe206f11671096ffdd38061171dd6e5` | INVENTORY §B |
+| 评分依赖 | 按 PR Dockerfile 钉的同组包离线安装：jiwer 4.0.0、RapidFuzz 3.13.0、openai-whisper 20250625、zhon 2.1.1、more-itertools、indic-numtowords、tiktoken/numba/llvmlite（内网镜像轮子） | `/data/sglang-omni-work/article/wheels/` |
+| 评分脚本身份 | `benchmarks/eval/benchmark_asr_seedtts.py` sha256 `08f4dc85…`；归一化 `benchmarks/tasks/asr.py::normalize_text`（EN 经 openai-whisper，ZH 经 zhon + 按字空格切分） | INVENTORY §D |
+
+## 2. 有效配置（PR #3199 A-only profile，主口径）
+
+等价 profile 文件：`/data/sglang-omni-work/article/pr3199_profiles/qwen3_asr_1_7b_npu.yaml`
+
+```yaml
+config_cls: Qwen3ASRPipelineConfig
+model_path: /home/weights/Qwen3-ASR-1.7B          # 本地权重；PR 原文为 Qwen/Qwen3-ASR-1.7B
+env_defaults:
+  PER_STREAM_QUEUE: "1"
+  TASK_QUEUE_ENABLE: "1"
+  ASCEND_LAUNCH_BLOCKING: "0"
+stages:
+  asr:
+    factory:
+      enable_async_decode: true
+      async_decode_min_batch_size: 1
+      enable_encoder_cuda_graph: true
+    engine:
+      disable_cuda_graph: true
+      cuda_graph_backend_prefill: disabled
+      enable_torch_compile: false
+      disable_radix_cache: true
+      max_running_requests: 64
+audio_chunking:
+  max_concurrent_long_audio_requests: 4
+```
+
+启动环境（与 PR cookbook 一致，仅路径本地化）：
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 \
+ASCEND_WORK_PATH=/data/sglang-omni-work/article/<run>/cann_work \
+ASCEND_USE_FIA=False PER_STREAM_QUEUE=1 TASK_QUEUE_ENABLE=1 ASCEND_LAUNCH_BLOCKING=0 \
+sgl-omni serve --config <profile>.yaml --port 8100
+```
+
+解析后的有效配置（启动日志核对）：
+
+| 项 | 有效值 | 证据 |
+|---|---|---|
+| encoder NPU 图 | 开启，懒捕获 | `captured encoder layer-stack graph bucket=128/256`；`memory checkpoint=post_encoder_graph_capture` |
+| LM decode/prefill 图 | 全部关闭（eager） | runtime profile `cuda_graph=False`；`Disable prefill CUDA graph ... prefill.backend='disabled'` |
+| async decode | 开启（threshold 1） | profile YAML + runtime |
+| torch_compile | **False**（YAML engine 级生效） | runtime profile `torch_compile=False`；`SGLANG_ENABLE_TORCH_COMPILE = 0` |
+| max_running_requests | 64 | runtime profile |
+| radix cache | YAML 要求 `disable_radix_cache: true`，但日志仍出现 `Init Unified Radix Cache` | **是否禁用未证实，记 unknown** |
+| 队列 env | `PER_STREAM_QUEUE=1`、`TASK_QUEUE_ENABLE=1`、`ASCEND_LAUNCH_BLOCKING=0` | `torch_npu.env: get env PER_STREAM_QUEUE = 1` 等 |
+| FIA | 未启用（`ASCEND_USE_FIA=False`） | 环境变量；decode 图关闭时不需要 FIA 才能捕获 |
+
+> 与本文早期草案的差异：早期草案用的是命令行方式（FIA=1、compile 实际 True、maxreq=8、max_concurrent_long_audio_requests 未设）。那份数据保留为附录 D（`runs_prevcfg_fia_maxreq8`），**不进入主表**。
+
+## 3. 数据输入清单与身份
+
+| 清单 | 内容 | 数量 / 时长 | 哈希 |
+|---|---|---|---|
+| EN 全量语料 | SeedTTS-Eval EN（HF revision `27f4c1adee83b5b29b7c4b375f6b976324bda308`），parquet `en-00000-of-00001.parquet` sha256 `5849b41b49cae996328c06d2c5791717c3bafc369bddfa1ec4f86761bb8bc0ca` | 1088 行 → 666 唯一音频（422 行为重复音频），均长 4.69 s，2.87–8.81 s | `seedtts_en_full/manifest.json` |
+| ZH 全量语料 | 同 revision `zh-00000-of-00001.parquet` sha256 `5d73be79cf2e84fd0bebf5d47212438a88dd264a591031d092164ba84545f1de` | 2020 行 → 1010 唯一音频，均长 4.68 s，4.00–10.16 s | `seedtts_zh_full/manifest.json` |
+| 性能固定清单 EN | `en_perf100.json`：短 34 / 中 33 / 长 33，3.00–8.81 s（均值 5.07 s） | 100 条，506.7 audio-s | `inputs_summary.json` |
+| 性能固定清单 ZH | `zh_perf100.json`：短 34 / 中 33 / 长 33，4.00–8.46 s（均值 5.07 s） | 100 条，507.2 audio-s | 同上 |
+| 稳定性混合清单 EN/ZH | 300 条真实短/中/长 + **20 条拼接长音频（17–24 s，标注 `synthetic_concat`，仅用于稳定性，不进入性能主表）** | 320 条/语言 | 同上 |
+
+- 重复音频说明：EN 1088 行中 422 行为重复音频（同一音频对应多条参考文本），ZH 2020 行中 1010 行为重复；WER/CER 的分母按**行**计，唯一音频数单独公布。上游 CI 同样按行统计，因此可直接对照。
+- 固定输入清单与执行顺序均落盘（`matrix_plan.json` 记录单元顺序与每单元轮次顺序，seed=20261029）。
+- 音频来源全部为真实 SeedTTS-Eval 参考音频；拼接音频独立标注，未混入性能主表。
+
+## 4. P0 统一性能（PR #3199 A-only profile，max_running_requests=8 变体）
+
+### 4.1 方法与覆盖
+
+- 配置：§2 的 PR profile（encoder 图开、LM eager、async decode 开、compile/radix 关、队列 env 按 PR 设置、FIA=False），唯一改动是 **`max_running_requests` 64 → 8**（原因见 §8.1 的 C8 挂起）。
+- 单元：Qwen3-ASR-1.7B × {EN, ZH} × {C1, C4} = **4 个单元**；每单元 **3 个独立服务进程轮次**，每轮全新进程、预热 ≤8 请求（不计统计）、**100 个正式请求**。
+- 输入：§3 的固定 100 条清单（同一语言下所有单元/轮次完全相同，顺序固定循环）。
+- 计时：发送开始 → 响应体读完（含上传与排队）；脚本在计时戳之后再做 JSON 解析与落盘。
+- 顺序：种子化并落盘（`matrix_plan.json`，seed=20261029），单元内轮次顺序做旋转。
+- 预算：正式请求 1200 / 上限 3600；墙钟 0.41 h / 上限 6 h。
+- 分位算法：排序 + 线性插值；每轮样本 100，**不报 p99**。
+- **C8 未测**：该 profile 在 C8 混合长度负载下两次出现「8 个请求永久 running、无完成」的挂起（maxreq=64 与 maxreq=8 各一次，NPU 进程内存约 53.7 GB），按 120 s 停止线终止该配置的 C8 负载并保留现场（§8.1）。因此 C8 不属于本文主表；早期另一配置的 C8 数据仅作附录 D 参考。
+- 原始证据：`runs/<unit>/round<N>/`（`run.env`、`serve_cmd.txt`、`serve_8100.log`、`health_start.json`、`requests.csv`、`summary.json`、`npu_samples.csv`、`cleanup.txt`）。
+
+### 4.2 三轮原始值与中位数
+
+| 单元 | 轮次吞吐 req/s | 吞吐中位 | p50 中位 | p95 中位 | 音频秒/墙钟秒（中位） | 失败/空 | NPU 进程峰值 |
+|---|---|---|---|---|---|---|---|
+| EN C1 | 1.931 / 2.016 / 1.867 | **1.931** | **508.7 ms** | 690.8 ms | 9.79 | 0/0 | 53.3 GB |
+| EN C4 | 5.996 / 5.782 / 6.045 | **5.996** | **655.1 ms** | 869.7 ms | 30.39 | 0/0 | 53.3 GB |
+| ZH C1 | 2.089 / 2.160 / 2.104 | **2.104** | **456.4 ms** | 633.1 ms | 10.67 | 0/0 | 53.3 GB |
+| ZH C4 | 6.298 / 6.040 / 6.279 | **6.279** | **614.7 ms** | 828.9 ms | 31.85 | 0/0 | 53.4 GB |
+
+- 全部 1200 个正式请求：**失败 0、空输出 0**。
+- 轮次间波动：C1 吞吐 ±4%，C4 ±2%；p50 波动 ≤5%（与本机负载同一量级）。
+- **NPU 进程峰值约 53.3 GB**：PR profile 未设 `mem_fraction_static`，KV/serving 缓存自动吃满可用 HBM（die 64 GB），这与 C8 挂起时内存触顶一致，是部署时需要注意的风险点。
+
+### 4.3 按音频长度分组（三轮中位数）
+
+| 单元 | short（EN 3.0–4.0 s / ZH 4.0–4.48 s） | medium（EN 4.01–5.82 / ZH 4.51–5.45 s） | long（EN 6.08–8.81 / ZH 5.50–8.46 s） |
+|---|---|---|---|
+| EN C1 | 455.8 ms / p95 549.7 | 524.0 / 661.8 | 574.3 / 785.3 |
+| EN C4 | 577.6 / 733.3 | 667.1 / 840.4 | 729.2 / 929.5 |
+| ZH C1 | 441.7 / 544.8 | 480.3 / 619.1 | 502.3 / 646.9 |
+| ZH C4 | 589.6 / 728.1 | 635.0 / 800.2 | 664.2 / 840.2 |
+
+（完整逐轮表见附录 A；数值为三轮中位数并按音频时长分桶。）
+
+### 4.4 与早期配置变体的对比（补充，不计入主表）
+
+同一固定清单、同一硬件下，早期配置（FIA=1、compile 实际开启、maxreq=8、未设队列 env、mem_fraction=0.25）测得：EN C1 1.86 req/s / p50 532 ms；ZH C1 2.06 req/s / p50 474 ms；EN C4 4.63 / 842 ms；ZH C4 4.97 / 772 ms；EN C8 8.31 / 939 ms；ZH C8 8.41 / 898 ms（详见附录 D）。
+
+- PR profile 相对早期配置主要是 **C4 明显更快**（约 +21% EN / +26% ZH 吞吐），C1 略快或持平；这是 async decode + 更大的请求上限带来的，而不是 encoder 图差异。
+- 该对比不是受控实验（多个变量同时变化），只用于说明「配置选择对吞吐影响很大」，**不作为加速倍数结论**。
+
+## 5. P0 质量证据（全量 SeedTTS-Eval，PR #3199 协议）
+
+### 5.1 方法（与 PR #3199 对齐）
+
+- 协议：**并发 4、单次通过、评分前不做 benchmark 预热、默认 2 GiB serving cache**；服务为 PR A-only profile（§2）。
+- 参考文本：数据集导出音频是 `ref_audio`，配对转写为 `ref_text`；EN 计词级 WER、ZH 计字级 CER。
+- 归一化与打分：直接调用仓库 `benchmarks/tasks/asr.py::normalize_text`（EN 走 openai-whisper 的英文归一化，ZH 走 zhon 标点剥离 + 按字空格切分），再用 `jiwer.process_words` 计算编辑数——与 PR 声明的方法一致。
+- 原始证据：`quality_pr_en/predictions.csv`、`quality_pr_zh/predictions.csv`（逐样本参考、假设、编辑数、延迟）、`quality_summary.json`（原始实现）与 `quality_summary_official.json`（官方口径复算）。
+
+> 修正说明：早期实现里 ZH 用了 `jiwer.process_characters`（把归一化后的空格也计入分母），导致 CER 被稀释成 0.404%。**该数字作废**；本文全部使用 `process_words`（与 PR 相同），分母为 33424 个字级 token。
+
+### 5.2 结果（PR 配置）
+
+| 语言 | 样本数 | 唯一音频 | 评测成功 | 失败 | 空输出 | corpus WER/CER | 编辑数 / 分母 | 逐样本均值 | >50% 样本 |
+|---|---|---|---|---|---|---|---|---|---|
+| EN | 1088 | 666 | 1088 | 0 | 0 | **1.2015%** | 159 / 13233 词 | 1.185% | 0 |
+| ZH | 2020 | 1010 | 2020 | 0 | 0 | **0.5924%** | 198 / 33424 字 | 0.565% | 0 |
+
+- 重复输入：EN 1088 行中 422 行为重复音频、ZH 2020 行中 1010 行为重复音频；分母按行计（与 PR/上游一致），唯一音频数单独公布。
+- 失败、空输出、已知退化模式均为 0；无样本 WER/CER > 50%。
+
+### 5.3 与 PR #3199 的对账
+
+| 模型/语言 | PR #3199（Ascend910_9362，CANN 9.0，torch_npu 2.10.0，Py3.11） | 本轮（Atlas A3 910C 单 die，CANN 9.1.0，torch_npu 2.10.0.post6，Py3.12） | 差异 |
+|---|---|---|---|
+| EN WER | 1.2031%（159 / 13216） | **1.2015%（159 / 13233）** | 编辑数完全相同；分母差 17 词（归一化版本差异） |
+| ZH CER | 0.5993%（200 / 33370） | **0.5924%（198 / 33424）** | 编辑数差 2（0.009 pp）；分母差 54 字 |
+
+- 两组差异都在归一化/栈版本的量级内，**质量可复现性成立**；但不能据此宣称跨硬件/跨 CANN 等价（PR 亦声明其数字不是跨硬件等价结论）。
+- 上游 CI 阈值（H100 标定）：EN corpus 0.0134、ZH corpus 0.0067；本轮 EN 0.0120、ZH 0.0059 均在阈值内，但阈值来自 CUDA 栈，仅作量级参照。
+
+### 5.4 配置敏感性对照（补充，不计入主表）
+
+早期命令行组合（FIA=1、compile 实际开启、maxreq=8、未设队列 env）在同一语料上的官方口径结果为 EN 160/13233（1.2091%）、ZH 204/33422（0.6104%）——与 PR 配置相差 <1 个编辑/千分位级，**说明切换参考配置未改变识别质量**。该组数据保存在 `runs_prevcfg_*` / `quality_en` / `quality_zh`，仅作对照。
+
+## 6. P1 有限时长稳定性（PR profile，C4 混合长短音频）
+
+### 6.1 方法与为什么是 C4
+
+- 稳定性使用与 §4 相同的 PR profile / `max_running_requests=8` 变体；输入为**混合清单**：300 条真实短/中/长音频 + 20 条标注为 `synthetic_concat` 的拼接长音频（17–24 s），固定种子打乱后循环发送。
+- 停止条件：**先到 60 分钟或 10000 个请求**即结束；两组均由**请求上限**先触发，实际时长见下表——只能表述为该实际时长与负载下的稳定性。
+- **为什么不是 C8**：PR profile 在 C8 混合长度负载下有可复现的挂起（§8.1，两次现场），按停止线规则不能再把 C8 作为采集负载；因此稳定性在 C4 采集，并与 §4 的 C4 性能点同配置。
+- 记录：成功率、超时/空结果、每 10 分钟窗口的吞吐与延迟、NPU 进程/HBM 内存趋势、错误类型、停止后的端口与 HBM 回收。
+- 原始证据：`stability_pr_c4_en/`、`stability_pr_c4_zh/`（`requests.csv` 逐请求、`stability_summary.json`、`stability_summary_v2.json`（修正窗口分母后的复算）、`npu_samples.csv`、`cleanup.txt`）。
+
+### 6.2 结果
+
+| 指标 | EN | ZH |
+|---|---|---|
+| 实际时长 | 31.04 min（停在 10003 请求上限） | 29.79 min（停在 10003 请求上限） |
+| 请求 / 成功 / 失败 / 空输出 | 10003 / 10003 / 0 / 0 | 10003 / 10003 / 0 / 0 |
+| 吞吐 | 5.37 req/s；31.6 audio-s/s | 5.60 req/s；34.2 audio-s/s |
+| 延迟 mean / p50 / p95 | 745 / 645 / 1879 ms | 715 / 624 / 1764 ms |
+| 每 10 分钟窗口 | 5.307 req/s / p50 640.4 / p95 1909.9 （600.0s）；5.353 req/s / p50 652.7 / p95 1882.6 （600.0s）；5.45 req/s / p50 640.5 / p95 1849.2 （600.0s）；5.365 req/s / p50 647.8 / p95 1817.8 （62.6s） | 5.515 req/s / p50 622.5 / p95 1764.2 （600.0s）；5.665 req/s / p50 619.4 / p95 1752.4 （600.0s）；5.603 req/s / p50 630.0 / p95 1750.7 （587.6s） |
+| 真实音频 / 拼接长音频 | real n=9380 p50 637.2 ms；synth n=623 p50 2136.1 ms | real n=9380 p50 615.1 ms；synth n=623 p50 1980.1 ms |
+| NPU 进程内存 | 52451→54677 MB | 52461→54181 MB |
+| HBM 使用 | 55275→57501 MB | 55285→57005 MB |
+| 错误类型 | 无 | 无 |
+| 回收 | 端口释放、进程退出、HBM 回落（`cleanup.txt`） | 同左 |
+
+### 6.3 解读边界
+
+- 两组都未出现失败或空输出；吞吐与 p50 在各窗口平稳（无衰减趋势）。NPU 进程内存呈缓慢上升（EN 52.4→54.7 GB，ZH 52.5→54.2 GB），未回落但也未失控；由于 PR profile 会把 HBM 用到接近 64 GB die 上限，长时间运行需要重点关注。
+- 实际覆盖约 30–31 分钟/组；**不足以宣称 60 分钟或全天候稳定**；拼接长音频占比约 6%，"混合长短"里的「长」主要是 5.5–8.8 s 的真实片段加少量 17–24 s 拼接片段。
+- 稳定性只在 C4 有效；C8 的稳定性未取得（该 profile 在 C8 挂起），这是本篇的明确缺口，不可用 C4 结果外推。
+- 早期配置变体曾在 C8 下完成 2×10007 请求的稳定性采集（见附录 D），但与 PR profile 不是同一配置，不能互相替代。
+
+## 7. 图路径与优化归因（本篇不宣称加速倍数）
+
+### 7.1 参考配置为什么是「encoder 图开 + LM eager」
+
+- PR #3199 的 A-only profile 明确：保留 encoder 图、保留异步 decode，但 **LM decode/prefill 用 eager**，并写明「Eager LM decode is the known-correct reference route on the tested stack; this configuration does not fix or explain the graph-enabled route's recognition regression」。也就是说 **LM 图路线在验证栈上存在识别回归**，参考配置出于正确性选择 eager，而不是因为图没有性能价值。
+- 历史会话 `session-7d9fe1b5…` 的 profiling 结论给出了量化边界：
+  - 基线（10 s 音频、单请求 1161 ms）拆分：请求构建 3.9 ms、encoder+prefill 约 14–68 ms、**decode 循环占 98%**（17.4 ms/token × 输出 token 数）。
+  - 真正的性能杠杆是 **decode 图**：`ASCEND_USE_FIA=1` 把 decode attention 从 ATB 换到 FIA 后 decode 图可被 ACL 捕获，单 token 17.4 → 3.3 ms，单请求 1161 → 248 ms（2.1× 以上）；
+  - `prefill full graph` 被校验拒绝（要求 graph batch 覆盖 prefill token 数），且 prefill 本身仅 14–36 ms，收益小；
+  - **encoder 图在默认配置下即已捕获**（`post_encoder_graph_capture`），其可优化上限受 encoder 阶段耗时占比约束（约 68 ms / 1161 ms ≈ 6%）。
+- 因此本篇的合理表述是：**encoder 图是参考配置的一部分，但它的收益上限只有个位数百分比；LM decode 图才是大杠杆，但在验证栈上有识别回归，故参考配置不启用。**
+
+### 7.2 本轮实测：encoder 图 ON vs eager（补充实验，非 PR 主口径）
+
+在早期命令行配置（FIA=1、maxreq=8、compile 实际开启）下做了单变量对照：只改 `--asr.factory.enable_encoder_cuda_graph`，其余相同；每臂 3 轮 × 100 请求，臂顺序交替；同输入同顺序比对输出。
+
+| 点 | encoder 图 p50 中位 | eager p50 中位 | 吞吐比（图/eager） | 输出一致性 |
+|---|---|---|---|---|
+| EN-C1 | 530.7 ms | 539.4 ms | 1.028 | 100/100 完全一致 |
+| ZH-C8 | 944.3 ms | 936.9 ms | 1.033 | 99/100 一致（唯一差异是标点 `，` vs `。`） |
+
+- 两个点的差异都在运行波动内（同单元三轮 p50 波动约 3–5%），方向上与「encoder 占比只有约 6%」的 profiling 结论一致。
+- **结论：在这些负载下没有可稳定复现的 encoder 图收益，因此不写加速倍数。** 这与 PR 保留 encoder 图并不矛盾：保留它是为了不劣化，而不是宣称提速。
+
+### 7.3 replay 证据：只有 capture，没有逐请求 replay 计数
+
+| 层级 | 做法 | 结果 |
+|---|---|---|
+| 应用日志 | 启动日志 encoder 图捕获行 | 图臂有 `captured encoder layer-stack graph bucket=128/256`；eager 臂 0 条 |
+| CANN plog（INFO） | `ASCEND_GLOBAL_LOG_LEVEL=1` + 隔离 `ASCEND_PROCESS_LOG_PATH`，统计 `StreamBeginCapture`/`ExecuteGraph` | 图臂 `StreamBeginCapture=1`、eager 臂 0；但 `ExecuteGraph` 两臂恒为 12，且请求数 5→50 不变 → 不是逐请求 replay 计数 |
+| CANN plog（DEBUG） | `ASCEND_GLOBAL_LOG_LEVEL=0`（204 MB 日志）检索 `replay/GraphLaunch/LaunchGraph/GraphExec` | 全 0 → DEBUG 级也不暴露 replay 事件 |
+
+结论：**capture 有正面证据，逐请求 replay 无可靠计数/trace**。按任务规则，不能仅凭开关与 capture 日志认定图路径生效；若文章需要断言 encoder 图收益，需补 torch_npu 侧 replay 计数探针或 msprof trace，并在同一栈上复测。
+
+### 7.4 与 PR #3199 的 before/A 对照的关系
+
+PR 自带 before/A 对照（before=A-only 之外的历史配方），其有效变量主要是 `PER_STREAM_QUEUE`；PR 结论是 1.7B 三点 mean 延迟 −2.73%~−3.83%、吞吐 +2.81%~+5.82%，同时明确「不建立通用加速结论」，且 0.6B 结果混合。本篇不重做该对照、不把其数字并入主表；如文章需要 before/A，直接引用 PR 原表并标注口径（附录 C.5）。
+
+## 8. 失败清单、偏差与未证明项（必须先读）
+
+### 8.1 采集失败 / 作废批次（全部保留现场）
+
+| 项 | 现象 | 处置 |
+|---|---|---|
+| 第一批矩阵（10:35） | NPU 采样器 bug：`npu-smi` 表格行 chip 映射错误、`proc-mem` 进程归属解析漏掉「进程行在被归属 Chip ID 之前」的格式，proc/HBM 峰值恒为基线 | 整批作废，保留为 `runs_badsampler_103530/`；修复采样器后同一脚本、同一 seed 重跑 |
+| 质量评测第一次（19:04） | 评分依赖装在容器内但首次调用在宿主 python 执行 → `ModuleNotFoundError: jiwer` | 改为 `docker exec` 在容器内执行；日志保留 |
+| **PR profile（max_running_requests=64）在 EN-C8 round3 挂起** | 8 个请求 `running` 持续 >15 分钟无完成，`pending_completions=8`，NPU 进程内存涨到 **53.7 GB / 64 GB**；健康检查仍 `healthy`；客户端 600 s 超时后服务端仍堆积 | 按「连续 120 s 无请求完成即停」规则停止该配置全部后续负载；现场保存于 `failure_pr_profile_c8/`（round3 目录、健康快照、npu proc-mem、serve 日志尾部）。**后续主测量改用同 profile 但 `max_running_requests=8` 的安全变体（唯一改动）**，并在 §8.2 记为偏差 |
+| PR profile C4 稳定性首跑（23:19） | 编排错误：两个稳定性链条同时等待矩阵结束，矩阵一结束它们同时启动、争用端口 8100；其中一个链条收尾时 `pkill -f "port 8100"` 把另一个链条的服务杀掉，造成 4998 个 `Connection refused` 假失败 | 两条链条全部终止，证据保留为 `failure_pr_c4_en_interfered/`；改为单一链条重跑，结果以重跑为准 |
+| ZH 指标口径错误（早期） | 早期用 `jiwer.process_characters`，把归一化后的空格计入分母，CER 被稀释为 0.404% | 全部改用与 PR 一致的 `process_words`（字符空格切分）；旧数字作废，正式数字见 §5 |
+
+### 8.2 与参考配置/任务书的偏差
+
+1. **PR profile 的 `max_running_requests` 由 64 降为 8**：原因是 8.1 的挂起现场（C8、mixed-length 固定清单）。其余 profile 项（encoder 图、异步 decode、LM eager、compile off、radix off、队列 env、FIA=False、OMP=4）保持不变。因此本文性能是「PR profile 的 maxreq=8 变体」。若文章必须引用 PR 原 profile 的并发上限，需要先解决该挂起（未在本轮展开）。
+2. **环境栈不同**：CANN 9.1.0（PR 9.0）、driver 25.5.0（25.5.1）、torch_npu 2.10.0.post6（2.10.0）、Python 3.12.13（3.11.15）、硬件 Atlas A3 910C（PR Ascend910_9362）。本文是**同配方、不同栈**的独立复现，不构成 exact-head 资格。
+3. **radix cache**：profile 传 `disable_radix_cache: true`，但启动日志仍出现 `Init Unified Radix Cache`，**是否真正禁用未证实（unknown）**。
+4. **0.6B 未测**（权重不在环境）：任务书的「两种模型」收敛为 1.7B 单模型；0.6B 的「两个英文替换错误」披露不在本包范围。
+5. **稳定性实际覆盖短于 60 分钟**：停在 10000 请求上限（见 §6），只能表述为该实际时长/负载下的稳定性。
+6. **图路径归因实验是在早期命令行配置下做的**（FIA=1、maxreq=8、compile 实际开启），不是 PR profile；作为补充证据（§7.2），不并入主表、不用于加速倍数。
+7. **全图 / realtime 不做**：条件任务未开展，只能作为后续验证方向。
+8. **客户端未测 CPU**：客户端瓶颈判断为间接推断（在途数 ≈ 并发度），无客户端侧采样证据。
+
+### 8.3 明确的「没有证明」
+
+- 未证明多卡/多机横向扩展能力与线性度；
+- 未证明全天候（24×7）生产稳定性、内存泄漏或长尾退化；
+- 未证明 decoded LM 图路线（PR 提到存在识别回归，本轮未复现该回归，也未修复）；
+- 未证明全图（encoder+prefill+decode 全图）正确性或收益；
+- 未证明 realtime（VAD/manual commit、多会话、cancel/clear、断开重连、首 partial 延迟）；
+- 未证明 0.6B 或其他模型；
+- 未证明与 GPU 平台或与 PR 所用 Ascend910_9362 的等价性/加速比。
+
+## 9. 清理结果（采集结束后）
+
+- 所有 `sgl-omni serve` 进程已停止（`ps` 匹配 0）；端口 8100–8115 无监听（`ss` 计数 0）。
+- NPU：chip1–chip15 的 `proc-mem` 均为 "No process in device"，HBM 回落基线；**chip0 上他人 vLLM 作业全程未受影响**（起止占用一致）。
+- 两次挂起现场均在停止前完整保存：`failure_pr_profile_c8/`（maxreq=64）、`failure_pr_profile_c8_run2/`（maxreq=8）；含 round 目录、健康快照、`npu-smi proc-mem`、服务日志尾部与时间戳。
+- 未重启 dockerd、未删除他人容器/镜像、未改仓库 tracked 文件；仅向容器安装评分用纯 Python/预编译轮子（离线）。
+- 每轮停止证据：各 run 目录 `cleanup.txt`；矩阵/稳定性驱动日志：`matrix_pr_c1c4.log`、`stability_pr_c4.log`、`quality_pr.log`。
+
+## 10. 证据索引（关键路径）
+
+完整清单（每个文件 sha256 或目录摘要）见服务器 `/data/sglang-omni-work/article/EVIDENCE_INDEX.md`。
+
+| 类别 | 路径 |
+|---|---|
+| 环境/版本盘点 | `INVENTORY.md` |
+| PR #3199 抓取件（正文/差异） | `.dsh/logs/pr3199.txt`、`.dsh/logs/pr3199.diff.txt`（本地 vault） |
+| 参考配置 profile | `pr3199_profiles/qwen3_asr_1_7b_npu.yaml`、`refcfg/REPORT.md` |
+| PR 配置矩阵（C1/C4） | `matrix_plan.json`、`runs/<unit>/round<N>/`、`matrix_pr_c1c4_table.md` |
+| 挂起/干扰失败现场 | `failure_pr_profile_c8/`（maxreq=64）、`failure_pr_profile_c8_run2/`（maxreq=8）、`failure_pr_c4_en_interfered/`（双链条端口冲突造成的假失败） |
+| 质量（PR 配置） | `quality_pr_en/`、`quality_pr_zh/`（predictions.csv、quality_summary*.json） |
+| 稳定性（PR 配置 C4） | `stability_pr_c4_en/`、`stability_pr_c4_zh/`（requests.csv、npu_samples.csv、stability_summary*.json、cleanup.txt） |
+| 早期配置补充证据 | `runs_prevcfg_fia_maxreq8/`、`matrix_prevcfg_table_prevcfg.md`、`quality_en/`、`quality_zh/`、`stability_en/`、`stability_zh/`、`attrib_en_c1/`、`attrib_zh_c8/` |
+| 输入清单 | `/data/asr_bench/article_inputs/inputs_summary.json`、`seedtts_{en,zh}_full/manifest.json` |
+| 采集脚本 | `bench/`（article_bench、run_matrix、serve_unit_pr(_safe)、stability_run、quality_eval、aggregate、make_evidence_index） |
+
+关键复现命令（节选，完整版见各 run 的 `serve_cmd.txt`）：
+
+```bash
+# PR #3199 A-only profile（本包主口径；max_running_requests 由 64 调整为 8，见 §8）
+cd /home/w00984239/sgl_work/sglang-omni
+ASCEND_RT_VISIBLE_DEVICES=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 \
+ASCEND_WORK_PATH=<rundir>/cann_work ASCEND_USE_FIA=False \
+PER_STREAM_QUEUE=1 TASK_QUEUE_ENABLE=1 ASCEND_LAUNCH_BLOCKING=0 \
+sgl-omni serve --config <profile>.yaml --asr.engine.max_running_requests 8 --port 8100 &
+
+# 矩阵（C1/C4；C8 因 profile 挂起未测，见 §8）
+python3 bench/run_matrix.py --requests 100 --rounds 3 --warmup 8 --chip 1 --port 8100 \
+  --serve-script serve_unit_pr_safe.sh --langs en,zh --concurrency 1,4
+
+# 质量（PR 协议：C4、单次、无评分预热）
+docker exec sglang-omni bash -lc "python3 bench/quality_eval.py --port 8100 --lang en \
+  --meta /data/asr_bench/seedtts_en_full/meta.lst --outdir quality_pr_en --concurrency 4"
+
+# 稳定性（PR profile，C4，先到 60min 或 10000 请求）
+python3 bench/stability_run.py --inputs .../<lang>_stability_combined.json --minutes 60 \
+  --max-requests 10000 --concurrency 4 --serve-script serve_unit_pr_safe.sh \
+  --outdir stability_pr_c4_<lang>
+```
+
+## 11. 脱敏与回传说明
+
+- 本文与回传附件**不含**：内网 IP/域名/对外端口、SSH 账号与凭据、代理口令、镜像仓库内网地址、客户名称与商务口径、他人作业与集群拓扑、人名邮箱。
+- 服务器主机名、绝对路径中的用户名、容器名仅保留在服务器证据索引中，不进入公开文章正文；引用路径统一改写为 `<workdir>/...`。
+- 原始音频、逐样本转录、完整服务日志与逐请求原始数据**留在服务器**；回传的是脱敏统计（本文 + 各 `*_summary.json` 摘录 + 证据索引）。
+- 每条结论均写明「证明了什么、没有证明什么」（§0、§8.3）。
+
+# 附录 A：PR 配置性能矩阵完整逐轮表（C1/C4）
+
+# P0 unified performance matrix (Qwen3-ASR-1.7B, reference config)
+
+Reference config: encoder NPU graph ON, LM prefill/decode graphs
+DISABLED (eager), pre-LM encoder off, max_running_requests=8,
+mem_fraction_static=0.25, single die per measurement, one fresh
+service process per round. Warmup <=8 requests excluded.
+Latency = send -> full response body (upload + queueing included).
+
+| unit | round | req | req/s | audio-s/s | mean ms | p50 ms | p95 ms | fail | empty | NPU proc peak MB |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Qwen3-ASR-1.7B-en-c1 | round1 | 100 | 1.931 | 9.787 | 517.4 | 508.7 | 690.8 | 0 | 0 | 53315 |
+| Qwen3-ASR-1.7B-en-c1 | round2 | 100 | 2.016 | 10.217 | 495.6 | 495.9 | 628.0 | 0 | 0 | 53315 |
+| Qwen3-ASR-1.7B-en-c1 | round3 | 100 | 1.867 | 9.462 | 535.1 | 538.6 | 719.0 | 0 | 0 | 53315 |
+| **Qwen3-ASR-1.7B-en-c1 median** | 3 rounds | – | 1.931 | 9.787 | 517.4 | 508.7 | 690.8 | – | – | 53315 |
+| Qwen3-ASR-1.7B-en-c4 | round1 | 100 | 5.996 | 30.386 | 657.2 | 655.1 | 832.4 | 0 | 0 | 53339 |
+| Qwen3-ASR-1.7B-en-c4 | round2 | 100 | 5.782 | 29.297 | 682.2 | 685.3 | 873.3 | 0 | 0 | 53339 |
+| Qwen3-ASR-1.7B-en-c4 | round3 | 100 | 6.045 | 30.632 | 651.5 | 648.8 | 869.7 | 0 | 0 | 53339 |
+| **Qwen3-ASR-1.7B-en-c4 median** | 3 rounds | – | 5.996 | 30.386 | 657.2 | 655.1 | 869.7 | – | – | 53339 |
+| Qwen3-ASR-1.7B-zh-c1 | round1 | 100 | 2.089 | 10.596 | 478.2 | 466.9 | 635.2 | 0 | 0 | 53279 |
+| Qwen3-ASR-1.7B-zh-c1 | round2 | 100 | 2.16 | 10.958 | 462.5 | 443.8 | 633.1 | 0 | 0 | 53279 |
+| Qwen3-ASR-1.7B-zh-c1 | round3 | 100 | 2.104 | 10.673 | 474.8 | 456.4 | 615.4 | 0 | 0 | 53279 |
+| **Qwen3-ASR-1.7B-zh-c1 median** | 3 rounds | – | 2.104 | 10.673 | 474.8 | 456.4 | 633.1 | – | – | 53279 |
+| Qwen3-ASR-1.7B-zh-c4 | round1 | 100 | 6.298 | 31.942 | 625.4 | 614.7 | 806.3 | 0 | 0 | 53375 |
+| Qwen3-ASR-1.7B-zh-c4 | round2 | 100 | 6.04 | 30.637 | 652.7 | 640.7 | 847.0 | 0 | 0 | 53375 |
+| Qwen3-ASR-1.7B-zh-c4 | round3 | 100 | 6.279 | 31.848 | 625.7 | 612.9 | 828.9 | 0 | 0 | 53375 |
+| **Qwen3-ASR-1.7B-zh-c4 median** | 3 rounds | – | 6.279 | 31.848 | 625.7 | 614.7 | 828.9 | – | – | 53375 |
+
+## Spread across the three rounds
+
+| unit | req/s range | p50 range | p95 range |
+|---|---|---|---|
+| Qwen3-ASR-1.7B-en-c1 | {'min': 1.867, 'max': 2.016, 'range': 0.149} | {'min': 495.9, 'max': 538.6, 'range': 42.7} | {'min': 628.0, 'max': 719.0, 'range': 91.0} |
+| Qwen3-ASR-1.7B-en-c4 | {'min': 5.782, 'max': 6.045, 'range': 0.263} | {'min': 648.8, 'max': 685.3, 'range': 36.5} | {'min': 832.4, 'max': 873.3, 'range': 40.9} |
+| Qwen3-ASR-1.7B-zh-c1 | {'min': 2.089, 'max': 2.16, 'range': 0.071} | {'min': 443.8, 'max': 466.9, 'range': 23.1} | {'min': 615.4, 'max': 635.2, 'range': 19.8} |
+| Qwen3-ASR-1.7B-zh-c4 | {'min': 6.04, 'max': 6.298, 'range': 0.258} | {'min': 612.9, 'max': 640.7, 'range': 27.8} | {'min': 806.3, 'max': 847.0, 'range': 40.7} |
+
+## By audio-length bucket (median of the three rounds)
+
+| unit | bucket | n/round | duration range s | mean ms | p95 ms | errors |
+|---|---|---|---|---|---|---|
+| Qwen3-ASR-1.7B-en-c1 | short | 34 | 3.0–4.0 | 455.8 | 549.7 | 0 |
+| Qwen3-ASR-1.7B-en-c1 | medium | 33 | 4.011–5.824 | 524.0 | 661.8 | 0 |
+| Qwen3-ASR-1.7B-en-c1 | long | 33 | 6.075–8.805 | 574.3 | 785.3 | 0 |
+| Qwen3-ASR-1.7B-en-c4 | short | 34 | 3.0–4.0 | 577.6 | 733.3 | 0 |
+| Qwen3-ASR-1.7B-en-c4 | medium | 33 | 4.011–5.824 | 667.1 | 840.4 | 0 |
+| Qwen3-ASR-1.7B-en-c4 | long | 33 | 6.075–8.805 | 729.2 | 929.5 | 0 |
+| Qwen3-ASR-1.7B-zh-c1 | short | 34 | 4.005–4.48 | 441.7 | 544.8 | 0 |
+| Qwen3-ASR-1.7B-zh-c1 | medium | 33 | 4.512–5.451 | 480.3 | 619.1 | 0 |
+| Qwen3-ASR-1.7B-zh-c1 | long | 33 | 5.504–8.459 | 502.3 | 646.9 | 0 |
+| Qwen3-ASR-1.7B-zh-c4 | short | 34 | 4.005–4.48 | 589.6 | 728.1 | 0 |
+| Qwen3-ASR-1.7B-zh-c4 | medium | 33 | 4.512–5.451 | 635.0 | 800.2 | 0 |
+| Qwen3-ASR-1.7B-zh-c4 | long | 33 | 5.504–8.459 | 664.2 | 840.2 | 0 |
+
+# 附录 B：早期配置变体完整逐轮表（含 C8，仅供参考）
+
+# P0 unified performance matrix (Qwen3-ASR-1.7B, reference config)
+
+Reference config: encoder NPU graph ON, LM prefill/decode graphs
+DISABLED (eager), pre-LM encoder off, max_running_requests=8,
+mem_fraction_static=0.25, single die per measurement, one fresh
+service process per round. Warmup <=8 requests excluded.
+Latency = send -> full response body (upload + queueing included).
+
+| unit | round | req | req/s | audio-s/s | mean ms | p50 ms | p95 ms | fail | empty | NPU proc peak MB |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Qwen3-ASR-1.7B-en-c1 | round1 | 100 | 1.789 | 9.064 | 558.6 | 553.3 | 741.9 | 0 | 0 | 16181 |
+| Qwen3-ASR-1.7B-en-c1 | round2 | 100 | 1.892 | 9.588 | 528.1 | 524.9 | 704.9 | 0 | 0 | 16181 |
+| Qwen3-ASR-1.7B-en-c1 | round3 | 100 | 1.859 | 9.419 | 537.5 | 532.0 | 687.4 | 0 | 0 | 16181 |
+| **Qwen3-ASR-1.7B-en-c1 median** | 3 rounds | – | 1.859 | 9.419 | 537.5 | 532.0 | 704.9 | – | – | 16181 |
+| Qwen3-ASR-1.7B-en-c4 | round1 | 100 | 4.58 | 23.21 | 860.6 | 856.6 | 1080.8 | 0 | 0 | 16203 |
+| Qwen3-ASR-1.7B-en-c4 | round2 | 100 | 4.626 | 23.44 | 851.7 | 841.9 | 1052.6 | 0 | 0 | 16203 |
+| Qwen3-ASR-1.7B-en-c4 | round3 | 100 | 4.814 | 24.396 | 817.3 | 807.3 | 1074.7 | 0 | 0 | 16205 |
+| **Qwen3-ASR-1.7B-en-c4 median** | 3 rounds | – | 4.626 | 23.44 | 851.7 | 841.9 | 1074.7 | – | – | 16203 |
+| Qwen3-ASR-1.7B-en-c8 | round1 | 100 | 8.359 | 42.356 | 926.1 | 939.0 | 1244.5 | 0 | 0 | 16225 |
+| Qwen3-ASR-1.7B-en-c8 | round2 | 100 | 8.063 | 40.86 | 962.8 | 965.1 | 1241.4 | 0 | 0 | 16225 |
+| Qwen3-ASR-1.7B-en-c8 | round3 | 100 | 8.306 | 42.091 | 925.3 | 933.7 | 1202.6 | 0 | 0 | 16225 |
+| **Qwen3-ASR-1.7B-en-c8 median** | 3 rounds | – | 8.306 | 42.091 | 926.1 | 939.0 | 1241.4 | – | – | 16225 |
+| Qwen3-ASR-1.7B-zh-c1 | round1 | 100 | 2.064 | 10.47 | 483.9 | 474.0 | 646.5 | 0 | 0 | 16205 |
+| Qwen3-ASR-1.7B-zh-c1 | round2 | 100 | 2.136 | 10.833 | 467.7 | 449.2 | 639.8 | 0 | 0 | 16205 |
+| Qwen3-ASR-1.7B-zh-c1 | round3 | 100 | 2.052 | 10.406 | 486.9 | 479.5 | 641.5 | 0 | 0 | 16205 |
+| **Qwen3-ASR-1.7B-zh-c1 median** | 3 rounds | – | 2.064 | 10.47 | 483.9 | 474.0 | 641.5 | – | – | 16205 |
+| Qwen3-ASR-1.7B-zh-c4 | round1 | 100 | 4.971 | 25.212 | 792.0 | 771.5 | 1036.5 | 0 | 0 | 28604 |
+| Qwen3-ASR-1.7B-zh-c4 | round2 | 100 | 12.067 | 61.201 | 328.7 | 322.4 | 446.2 | 0 | 0 | 17094 |
+| Qwen3-ASR-1.7B-zh-c4 | round3 | 100 | 4.422 | 22.429 | 893.7 | 887.5 | 1165.1 | 0 | 0 | 28604 |
+| **Qwen3-ASR-1.7B-zh-c4 median** | 3 rounds | – | 4.971 | 25.212 | 792.0 | 771.5 | 1036.5 | – | – | 28604 |
+| Qwen3-ASR-1.7B-zh-c8 | round1 | 100 | 8.648 | 43.861 | 905.1 | 898.0 | 1188.9 | 0 | 0 | 16249 |
+| Qwen3-ASR-1.7B-zh-c8 | round2 | 100 | 8.406 | 42.637 | 920.2 | 880.9 | 1215.7 | 0 | 0 | 16249 |
+| Qwen3-ASR-1.7B-zh-c8 | round3 | 100 | 6.954 | 35.272 | 1131.2 | 952.6 | 3160.2 | 0 | 0 | 16249 |
+| **Qwen3-ASR-1.7B-zh-c8 median** | 3 rounds | – | 8.406 | 42.637 | 920.2 | 898.0 | 1215.7 | – | – | 16249 |
+
+## Spread across the three rounds
+
+| unit | req/s range | p50 range | p95 range |
+|---|---|---|---|
+| Qwen3-ASR-1.7B-en-c1 | {'min': 1.789, 'max': 1.892, 'range': 0.103} | {'min': 524.9, 'max': 553.3, 'range': 28.4} | {'min': 687.4, 'max': 741.9, 'range': 54.5} |
+| Qwen3-ASR-1.7B-en-c4 | {'min': 4.58, 'max': 4.814, 'range': 0.234} | {'min': 807.3, 'max': 856.6, 'range': 49.3} | {'min': 1052.6, 'max': 1080.8, 'range': 28.2} |
+| Qwen3-ASR-1.7B-en-c8 | {'min': 8.063, 'max': 8.359, 'range': 0.296} | {'min': 933.7, 'max': 965.1, 'range': 31.4} | {'min': 1202.6, 'max': 1244.5, 'range': 41.9} |
+| Qwen3-ASR-1.7B-zh-c1 | {'min': 2.052, 'max': 2.136, 'range': 0.084} | {'min': 449.2, 'max': 479.5, 'range': 30.3} | {'min': 639.8, 'max': 646.5, 'range': 6.7} |
+| Qwen3-ASR-1.7B-zh-c4 | {'min': 4.422, 'max': 12.067, 'range': 7.645} | {'min': 322.4, 'max': 887.5, 'range': 565.1} | {'min': 446.2, 'max': 1165.1, 'range': 718.9} |
+| Qwen3-ASR-1.7B-zh-c8 | {'min': 6.954, 'max': 8.648, 'range': 1.694} | {'min': 880.9, 'max': 952.6, 'range': 71.7} | {'min': 1188.9, 'max': 3160.2, 'range': 1971.3} |
+
+## By audio-length bucket (median of the three rounds)
+
+| unit | bucket | n/round | duration range s | mean ms | p95 ms | errors |
+|---|---|---|---|---|---|---|
+| Qwen3-ASR-1.7B-en-c1 | short | 34 | 3.0–4.0 | 462.5 | 558.4 | 0 |
+| Qwen3-ASR-1.7B-en-c1 | medium | 33 | 4.011–5.824 | 546.9 | 685.0 | 0 |
+| Qwen3-ASR-1.7B-en-c1 | long | 33 | 6.075–8.805 | 605.6 | 785.9 | 0 |
+| Qwen3-ASR-1.7B-en-c4 | short | 34 | 3.0–4.0 | 750.5 | 925.5 | 0 |
+| Qwen3-ASR-1.7B-en-c4 | medium | 33 | 4.011–5.824 | 859.5 | 1029.7 | 0 |
+| Qwen3-ASR-1.7B-en-c4 | long | 33 | 6.075–8.805 | 948.2 | 1206.1 | 0 |
+| Qwen3-ASR-1.7B-en-c8 | short | 34 | 3.0–4.0 | 797.1 | 1006.1 | 0 |
+| Qwen3-ASR-1.7B-en-c8 | medium | 33 | 4.011–5.824 | 957.1 | 1171.3 | 0 |
+| Qwen3-ASR-1.7B-en-c8 | long | 33 | 6.075–8.805 | 1037.7 | 1284.0 | 0 |
+| Qwen3-ASR-1.7B-zh-c1 | short | 34 | 4.005–4.48 | 444.6 | 540.5 | 0 |
+| Qwen3-ASR-1.7B-zh-c1 | medium | 33 | 4.512–5.451 | 486.9 | 615.1 | 0 |
+| Qwen3-ASR-1.7B-zh-c1 | long | 33 | 5.504–8.459 | 521.5 | 691.1 | 0 |
+| Qwen3-ASR-1.7B-zh-c4 | short | 34 | 4.005–4.48 | 749.8 | 919.6 | 0 |
+| Qwen3-ASR-1.7B-zh-c4 | medium | 33 | 4.512–5.451 | 802.4 | 1002.9 | 0 |
+| Qwen3-ASR-1.7B-zh-c4 | long | 33 | 5.504–8.459 | 825.1 | 1060.9 | 0 |
+| Qwen3-ASR-1.7B-zh-c8 | short | 34 | 4.005–4.48 | 847.6 | 1056.9 | 0 |
+| Qwen3-ASR-1.7B-zh-c8 | medium | 33 | 4.512–5.451 | 920.4 | 1200.4 | 0 |
+| Qwen3-ASR-1.7B-zh-c8 | long | 33 | 5.504–8.459 | 994.7 | 1230.2 | 0 |
+
+## 附录 C：与 PR #3199 的对账（本文口径 vs 已验证参考配置）
+
+PR：[sgl-project/sglang-omni#3199](https://github.com/sgl-project/sglang-omni/pull/3199)，标题「[NPU] Add Qwen3-ASR 0.6B and 1.7B reference deployment profiles」，状态 Open（2026-10-29 读取），作者 celestial-micha。
+
+### C.1 参考配置（A-only profile）原文要点
+
+| 项 | PR #3199 的 A-only 取值 | 本文主口径是否一致 |
+|---|---|---|
+| encoder NPU 图 | `enable_encoder_cuda_graph: true` | 一致 |
+| LM decode / prefill 图 | `disable_cuda_graph: true`、`cuda_graph_backend_prefill: disabled`（LM 两条路径均 eager） | 一致（图路径关闭） |
+| torch compile | `enable_torch_compile: false`（engine 级） | 一致（本文用 `--config` 方式，engine 级生效；此前命令行方式被 typed 默认覆盖，见 §8） |
+| radix cache | `disable_radix_cache: true` | 按 PR 配置传入；运行时日志仍出现 `Init Unified Radix Cache`，**是否真正禁用未证实**（记为 unknown） |
+| async decode | `enable_async_decode: true`、`async_decode_min_batch_size: 1` | 一致（PR 配置显式开启） |
+| max_running_requests | 64 | 一致 |
+| 长音频并发 | `max_concurrent_long_audio_requests: 4` | 一致 |
+| 队列环境 | `PER_STREAM_QUEUE=1`、`TASK_QUEUE_ENABLE=1`、`ASCEND_LAUNCH_BLOCKING=0` | 一致（作为进程启动前 env） |
+| FIA | `ASCEND_USE_FIA=False`（未启用 FIA） | 一致 |
+| CPU 线程 | `OMP/MKL/OPENBLAS_NUM_THREADS=4` | 一致 |
+| CANN 工作目录 | `ASCEND_WORK_PATH=/tmp/qwen3-asr-cann-work` | 一致（改用 /data 下可写目录） |
+
+### C.2 评测栈差异（不可忽略）
+
+| 项 | PR #3199 | 本轮实测环境 |
+|---|---|---|
+| 硬件 | 1× Ascend910_9362（64 GiB） | Atlas 900 A3（910C），单 die（chip1） |
+| driver | 25.5.1 | 25.5.0 |
+| CANN | 9.0/A3 | 9.1.0 |
+| Python | 3.11.15 | 3.12.13 |
+| PyTorch / TorchNPU | 2.10.0+cpu / 2.10.0 | 2.10.0+cpu / 2.10.0.post6 |
+| SGLang | 0.5.22 | 0.5.22 |
+| Omni | 635c463 运行时 / PR 基线 58c4ebb | main `72b776c9c` |
+
+> 结论：本轮是**同配方、不同栈**的独立复现；数字接近不等于等价资格。
+
+### C.3 质量结果对账（本文按 PR 协议复测：C4、单次、无预热评分请求、默认 2 GiB 服务缓存）
+
+| 模型 | 语言 | PR #3199 | 本轮（PR 配置复测） | 差异 |
+|---|---|---|---|---|
+| Qwen3-ASR-1.7B | EN WER | 1.2031%（159 / 13216 词） | 1.2015%（159 / 13233 词） | 编辑数相同（159 vs 159）；分母差 17 词 |
+| Qwen3-ASR-1.7B | ZH CER | 0.5993%（200 / 33370 字） | 0.5924%（198 / 33424 字） | 编辑数 −2（−0.007 pp）；分母 +54 字 |
+
+- 差异幅度在 0.01 个百分点量级，方向上一致；分母的少量差异来自归一化实现与栈版本差异（PR 固定 `jiwer/RapidFuzz/openai-whisper/zhon` 版本，本轮使用同等包但版本由内网镜像可得版本决定）。
+- PR 明确：这是**独立模型评测**，不是 before/after 或 GPU/NPU 等价性结论；本文沿用同样限定。
+
+### C.4 参考性能对账
+
+PR 的 1.7B 参考性能只覆盖 3 个 medium 音频点（EN-C1、ZH-C1、ZH-C8），且**使用 1-byte pre-LM cache 覆盖以排除缓存命中**、输入为拼接的中/长音频，因此与本文固定清单（真实短/中/长混合）不可直接比数。PR 自身也未给出「加速倍数」或全并发结论。
+
+因此本文的性能主表**不引用 PR 的秒数**，只引用其**配置与协议**；两者关系是「同一配方、不同输入清单与栈」。
+
+### C.5 PR 的 before/A 对照（本包不重做，直接引用其结论）
+
+PR 在同一台 Ascend910_9362 上做了 before/A 四窗口交替测量（每臂每点 24 个正式观测），结论：
+
+- 1.7B：三个点 mean 延迟下降 2.73%–3.83%，吞吐 +2.81%–+5.82%；两个顺序块方向一致（但 EN P95 在第二块上升 1.10%）。
+- 0.6B：结果混合（英文 -1.80% 但两个顺序块方向相反；中文两组均 +5.26%/+5.29%）。
+- 有效变量主要是 `PER_STREAM_QUEUE`（编码器图与异步 decode 在 before/A 中都存在）；PR 明确「不建立通用加速结论」，所有退化行保留。
+
+本文不把这组数字并入性能主表；如文章需要 before/A，应直接引用 PR 原表并标注其口径。
+
+### C.6 接口检查与资源监控（PR 已有，本文不重复）
+
+- 接口：每个模型 13 项检查（10 个成功非空响应 + 3 个预期 HTTP 400 拒绝，含非法输入后恢复），8 个官方样例响应满足 CER ≤ 0.1。
+- 资源监控：1.7B 缺口语料运行 197 个采样点、无争用；before/A 对照 463 个采样点、无监听错误或争用；服务清理均通过。
+- 本文 §7/§6 的资源采样与清理是其独立补充，不替代 PR 的检查记录。
+
+## 附录 D：早期配置变体（补充证据，不计入主表）
+
+> 说明：这是在发现 PR #3199 profile 之前使用的一组配置。它同样满足「encoder 图开 + LM prefill/decode eager」，但其余项不同：`ASCEND_USE_FIA=1`、`enable_torch_compile` 实际为 True（命令行 flag 被 typed 默认覆盖）、`max_running_requests=8`、`mem_fraction_static=0.25`、未设置队列 env、未限制长音频并发数。**它不是 PR profile，不能与主表混用**；保留它是因为：①它是唯一完整覆盖 C1/C4/C8 的矩阵；②它提供了 C8 下的稳定性与 encoder 图归因数据。
+
+### D.1 完整矩阵（6 单元 × 3 轮 × 100 请求 = 1800 正式请求，0 失败）
+
+| 单元 | 吞吐中位 req/s | p50 中位 ms | p95 中位 ms | 三轮吞吐范围 |
+|---|---|---|---|---|
+| EN C1 | 1.859 | 532.0 | 704.9 | 1.789–1.892 |
+| EN C4 | 4.626 | 841.9 | 1074.7 | 4.580–4.814 |
+| EN C8 | 8.306 | 939.0 | 1241.4 | 8.063–8.359 |
+| ZH C1 | 2.064 | 474.0 | 641.5 | 2.052–2.136 |
+| ZH C4 | 4.971 | 771.5 | 1036.5 | 4.422–12.067（含争用异常轮） |
+| ZH C8 | 8.406 | 898.0 | 1215.7 | 6.954–8.648 |
+
+- 详细逐轮表、音频长度分组、NPU 峰值与争用说明：`matrix_prevcfg_table_prevcfg.md`、`runs_prevcfg_fia_maxreq8/`。
+- 异常轮次（zh-c4 两轮同 die 他人作业争用、zh-c8 round3 p95 3160 ms）保留原值并已在附录表内注明，未剔除。
+
+### D.2 C8 稳定性（各 10007 请求，0 失败）
+
+| 指标 | EN | ZH |
+|---|---|---|
+| 实际时长 | 23.79 min | 22.02 min |
+| 请求 / 成功 / 失败 / 空输出 | 10007 / 10007 / 0 / 0 | 10007 / 10007 / 0 / 0 |
+| 吞吐 | 7.01 req/s；41.2 audio-s/s | 7.58 req/s；46.3 audio-s/s |
+| 延迟 mean / p50 / p95 | 1141 / 973 / 2975 ms | 1056 / 917 / 2648 ms |
+| NPU 进程内存 | 15727→17043 MB | 15697→16937 MB |
+| HBM | 18552→19868 MB | 18552→19762 MB |
+| 错误 | 无 | 无 |
+
+证据：`stability_en/`、`stability_zh/`。
+
+### D.3 encoder 图 ON vs eager 归因（早期配置，EN-C1 / ZH-C8）
+
+| 点 | 图 p50 / 吞吐 | eager p50 / 吞吐 | 吞吐比 | 输出一致性 |
+|---|---|---|---|---|
+| EN-C1 | 530.7 ms / 1.888 req/s | 539.4 ms / 1.837 req/s | 1.028 | 100/100 一致 |
+| ZH-C8 | 944.3 ms / 8.391 req/s | 936.9 ms / 8.124 req/s | 1.033 | 99/100 一致（标点差异） |
+
+差异在运行波动内；capture 有证据、逐请求 replay 无可靠计数（§7.3）。证据：`attrib_en_c1/`、`attrib_zh_c8/`。
