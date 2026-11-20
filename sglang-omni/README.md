@@ -1,5 +1,12 @@
 # SGLang-Omni engineering notes
 
+## Latest DFlash reproduction — 2026-11-20
+
+Single-die Ascend A3, SGLang 0.5.23 / Omni 0.2.0, DFlash decode graphs and concurrency 1–64. Includes environment, configuration, deployment, benchmark commands, latency/throughput/CER tables and reproduction limits.
+
+- [中文：DFlash 性能与复现记录](qwen3-asr-ascend-dflash-reproduction-2026-11-20.zh-CN.md)
+- [English: DFlash Performance and Reproduction](qwen3-asr-ascend-dflash-reproduction-2026-11-20.en.md)
+
 ## Qwen3-ASR on Ascend A3: performance results
 
 Stage performance results, feature comparisons, recognition quality, and reproduction instructions. The standalone benchmark script package is still pending publication.
