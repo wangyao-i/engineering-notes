@@ -9,6 +9,13 @@ Single-die Ascend A3, SGLang 0.5.23 / Omni 0.2.0, DFlash decode graphs and concu
 
 ## Qwen3-ASR on Ascend A3: performance results
 
+### Latest tuning results — 2026-11-23
+
+B0/B2b/B3 latency, throughput, CER and A-B-B-A run-to-run variation.
+
+- [中文：2026-11-23 调优结果](qwen3-asr-ascend-tuning-results-2026-11-23.zh-CN.md)
+- [English: 2026-11-23 Tuning Results](qwen3-asr-ascend-tuning-results-2026-11-23.en.md)
+
 Stage performance results, feature comparisons, recognition quality, and reproduction instructions. The standalone benchmark script package is still pending publication.
 
 - [中文：性能实践、图优化与复现](qwen3-asr-ascend-performance.zh-CN.md)
